@@ -1300,6 +1300,54 @@ async def health(check: str = "") -> JSONResponse:
     return JSONResponse(result)
 
 
+@app.get("/api/debug/order")
+async def debug_order(name: str = "") -> JSONResponse:
+    """
+    Temporary debug endpoint — fetch a Shopify order by name and return its raw structure.
+    GET /api/debug/order?name=1045   (pass the number without #)
+    Remove this endpoint once the order field mapping is confirmed.
+    """
+    if not name:
+        return JSONResponse({"error": "Pass ?name=<order_number> e.g. ?name=1045"}, status_code=400)
+
+    query = """
+    query GetOrder($query: String!) {
+      orders(first: 1, query: $query) {
+        edges {
+          node {
+            id
+            name
+            note
+            phone
+            shippingAddress {
+              firstName lastName phone address1 address2 city province country zip
+            }
+            customAttributes { key value }
+            lineItems(first: 20) {
+              edges {
+                node {
+                  title quantity originalUnitPriceSet { shopMoney { amount } }
+                  variant { id }
+                }
+              }
+            }
+            tags
+            createdAt
+          }
+        }
+      }
+    }
+    """
+    try:
+        data = await _shopify_gql(query, {"query": f"name:#{name}"})
+        edges = data["data"]["orders"]["edges"]
+        if not edges:
+            return JSONResponse({"error": f"Order #{name} not found"}, status_code=404)
+        return JSONResponse(edges[0]["node"])
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.get("/api/webhook")
 async def verify_webhook(request: Request) -> Response:
     """
