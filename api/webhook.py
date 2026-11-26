@@ -80,8 +80,8 @@ def get_redis() -> Redis:
     global _redis
     if _redis is None:
         url = (
-            os.getenv("UPSTASH_REDIS_REST_KV_URL")
-            or os.getenv("UPSTASH_REDIS_REST_URL", "")
+            os.getenv("UPSTASH_REDIS_REST_KV_REST_API_URL")  # Vercel Storage integration
+            or os.getenv("UPSTASH_REDIS_REST_URL", "")        # local dev fallback
         )
         token = (
             os.getenv("UPSTASH_REDIS_REST_KV_REST_API_TOKEN")
