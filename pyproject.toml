@@ -1,2 +1,13 @@
+[project]
+name = "inflora-bot"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "httpx",
+    "upstash-redis",
+    "python-dotenv",
+]
+
 [tool.vercel]
 entrypoint = "api.webhook:app"

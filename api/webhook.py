@@ -28,7 +28,6 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
-from mangum import Mangum
 from upstash_redis.asyncio import Redis
 
 # ---------------------------------------------------------------------------
@@ -1313,10 +1312,5 @@ async def receive_webhook(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-# ===========================================================================
-# SECTION 7 — Vercel / AWS Lambda handler (Mangum ASGI adapter)
-# ===========================================================================
-
-# Vercel Python runtime expects a callable named `handler` in the module.
-# Mangum wraps the FastAPI ASGI app to handle the serverless invocation format.
-handler = Mangum(app, lifespan="off")
+# Vercel's FastAPI integration (declared in pyproject.toml) manages the ASGI
+# bridge directly — no Mangum adapter needed.
