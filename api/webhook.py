@@ -69,8 +69,8 @@ CATALOG_TTL = 1800   # 30 min — catalog cache
 # ---------------------------------------------------------------------------
 # Redis client (singleton, lazily initialised)
 # ---------------------------------------------------------------------------
-# upstash_redis reads UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN
-# automatically via from_env().
+# Vercel's Upstash Storage integration injects KV-prefixed variable names.
+# We read those explicitly and fall back to the plain names for local dev.
 
 _redis: Redis | None = None
 
@@ -79,7 +79,15 @@ def get_redis() -> Redis:
     """Return the shared async Redis client, creating it on first call."""
     global _redis
     if _redis is None:
-        _redis = Redis.from_env()
+        url = (
+            os.getenv("UPSTASH_REDIS_REST_KV_URL")
+            or os.getenv("UPSTASH_REDIS_REST_URL", "")
+        )
+        token = (
+            os.getenv("UPSTASH_REDIS_REST_KV_REST_API_TOKEN")
+            or os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+        )
+        _redis = Redis(url=url, token=token)
     return _redis
 
 
@@ -1197,13 +1205,23 @@ app = FastAPI(title="Inflora WhatsApp Order Bot")
 
 
 @app.get("/api/health")
-async def health() -> JSONResponse:
+async def health(check: str = "") -> JSONResponse:
     """
-    Health check endpoint — confirms the function is running on Vercel.
-    Does not require any env vars or external connections.
-    GET /api/health → 200 {"status": "ok", "service": "inflora-bot"}
+    Health check endpoint.
+    GET /api/health          → basic liveness check (no external calls)
+    GET /api/health?check=redis → also pings Upstash Redis
     """
-    return JSONResponse({"status": "ok", "service": "inflora-bot"})
+    result: dict = {"status": "ok", "service": "inflora-bot"}
+
+    if check == "redis":
+        try:
+            pong = await get_redis().ping()
+            result["redis"] = "ok" if pong else "unexpected response"
+        except Exception as exc:
+            result["redis"] = f"error: {exc}"
+            result["status"] = "degraded"
+
+    return JSONResponse(result)
 
 
 @app.get("/api/webhook")
