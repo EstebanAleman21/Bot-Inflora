@@ -602,7 +602,7 @@ async def create_draft_order(session: dict) -> dict:
         "metafields": [
             {
                 "namespace": "custom",
-                "key": "fecha_de_entrega",
+                "key": "fecha_de_entrega-d0ef",
                 "value": delivery_date,
                 "type": "date",
             }
