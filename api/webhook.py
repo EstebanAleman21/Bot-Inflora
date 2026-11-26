@@ -556,7 +556,7 @@ def _parse_mx_address(full_address: str) -> dict:
 
     zip_match = re.search(r"\b(\d{5})\b", s)
     if not zip_match:
-        return {"address1": s, "city": "", "province": "", "zip": ""}
+        return {"address1": s, "city": "", "province": "Nuevo León", "zip": ""}
 
     zip_code = zip_match.group(1)
 
@@ -568,7 +568,7 @@ def _parse_mx_address(full_address: str) -> dict:
     parts = [p.strip() for p in after_zip.split(",") if p.strip()]
 
     city     = parts[0] if parts else ""
-    province = parts[1] if len(parts) > 1 else ""
+    province = parts[1] if len(parts) > 1 else "Nuevo León"
 
     return {"address1": address1, "city": city, "province": province, "zip": zip_code}
 
