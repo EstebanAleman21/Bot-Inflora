@@ -592,11 +592,21 @@ async def create_draft_order(session: dict) -> dict:
     customer_id    = await find_or_create_customer(customer_email, customer_name)
 
     # ── Assemble draft input ──────────────────────────────────────────────
+    delivery_date = session.get("delivery_date", "")
+
     draft_input: dict[str, Any] = {
         "lineItems": line_items,
         "customAttributes": custom_attrs,
         "shippingAddress": shipping_address,
         "tags": tags,
+        "metafields": [
+            {
+                "namespace": "custom",
+                "key": "fecha_de_entrega",
+                "value": delivery_date,
+                "type": "date",
+            }
+        ],
     }
     if note:
         draft_input["note"] = note
@@ -1055,7 +1065,7 @@ _ORDER_TEMPLATE = (
     "Por favor completa los siguientes datos y envíalos en un solo mensaje:\n\n"
     "• Nombre del cliente:\n"
     "• Correo del cliente:\n"
-    "• Fecha de entrega:\n\n"
+    "• Fecha de entrega (YYYY-MM-DD):\n\n"
     "• Nombre de la persona que recibe el arreglo:\n"
     "• Dirección de envío completa (calle, número, colonia, municipio y código postal):\n"
     "• Teléfono de la persona que recibe el arreglo:\n\n"
@@ -1149,6 +1159,58 @@ def _parse_template(text: str) -> dict:
     return result
 
 
+_MONTH_MAP: dict[str, int] = {
+    # Spanish
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+    # English
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def _normalize_date(raw: str) -> str:
+    """
+    Convert a free-text date into YYYY-MM-DD.
+    Handles:
+      - Already normalized:          2026-11-27
+      - Numeric DD/MM/YYYY:          27/11/2026  or  27-11-2026
+      - Spanish/English named month: 27 Noviembre 2026
+                                     27 de noviembre de 2026
+                                     November 27, 2026
+    Returns the original string unchanged if no pattern matches.
+    """
+    s = raw.strip()
+
+    # Already YYYY-MM-DD
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+    # DD/MM/YYYY or DD-MM-YYYY
+    m = re.fullmatch(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})", s)
+    if m:
+        return f"{int(m.group(3)):04d}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+
+    # "27 Noviembre 2026" / "27 de Noviembre de 2026"
+    m = re.search(r"(\d{1,2})\s+(?:de\s+)?([a-záéíóúñ]+)\s+(?:de\s+)?(\d{4})", s, re.IGNORECASE)
+    if m:
+        month = _MONTH_MAP.get(m.group(2).lower())
+        if month:
+            return f"{int(m.group(3)):04d}-{month:02d}-{int(m.group(1)):02d}"
+
+    # "November 27, 2026" / "November 27 2026"
+    m = re.search(r"([a-záéíóúñ]+)\s+(\d{1,2})[,\s]+(\d{4})", s, re.IGNORECASE)
+    if m:
+        month = _MONTH_MAP.get(m.group(1).lower())
+        if month:
+            return f"{int(m.group(3)):04d}-{month:02d}-{int(m.group(2)):02d}"
+
+    return s  # fallback: return as-is
+
+
 async def handle_fill_template(phone: str, session: dict, text: str) -> None:
     """
     Parse the filled-in order template and advance to SELECT_PAYMENT.
@@ -1170,7 +1232,7 @@ async def handle_fill_template(phone: str, session: dict, text: str) -> None:
         await show_order_template(phone)
         return
 
-    session["delivery_date"]    = parsed["delivery_date"]
+    session["delivery_date"]    = _normalize_date(parsed["delivery_date"])
     session["recipient_name"]   = parsed["recipient_name"]
     session["recipient_phone"]  = parsed["recipient_phone"]
     session["recipient_address"]= parsed["recipient_address"]
