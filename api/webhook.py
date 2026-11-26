@@ -481,28 +481,33 @@ mutation CustomerCreate($input: CustomerInput!) {
 """
 
 
+
 async def find_or_create_customer(email: str, full_name: str) -> str | None:
     """
-    Look up a Shopify customer by email. If found, return their GID.
-    If not found, create them and return the new GID.
-    Returns None if email is blank or on any error (order creation continues without customerId).
+    Look up a Shopify customer by email.
+    - Found: update their name to match the template, return their GID.
+    - Not found: create them and return the new GID.
+    Returns None if email is blank or on any error (order continues without customerId).
     """
     if not email:
         return None
     try:
+        name_parts = full_name.strip().split(" ", 1)
+        first_name = name_parts[0]
+        last_name  = name_parts[1] if len(name_parts) > 1 else ""
+
         data = await _shopify_gql(_CUSTOMER_SEARCH, {"query": f"email:{email}"})
+        if data.get("errors") or data.get("data") is None:
+            log.warning("customerSearch GQL error: %s", data.get("errors"))
+            return None
         edges = data["data"]["customers"]["edges"]
         if edges:
             return edges[0]["node"]["id"]
 
         # Not found — create
-        name_parts = full_name.strip().split(" ", 1)
-        customer_input: dict[str, Any] = {
-            "email": email,
-            "firstName": name_parts[0],
-        }
-        if len(name_parts) > 1:
-            customer_input["lastName"] = name_parts[1]
+        customer_input: dict[str, Any] = {"email": email, "firstName": first_name}
+        if last_name:
+            customer_input["lastName"] = last_name
 
         result = await _shopify_gql(_CUSTOMER_CREATE, {"input": customer_input})
         payload = result["data"]["customerCreate"]
