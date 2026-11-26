@@ -460,13 +460,17 @@ mutation DraftOrderComplete($id: ID!) {
 
 async def create_draft_order(session: dict) -> dict:
     """
-    Create a Shopify Draft Order from the session data.
+    Create a Shopify Draft Order from the session data, matching the store's
+    existing order structure (shippingAddress, DATE/SLOT custom attrs, tags).
 
     Returns:
       {"draftOrderId": str, "name": str, "invoiceUrl": str}
 
     Raises ValueError if Shopify returns userErrors.
     """
+    is_pickup: bool = session.get("is_pickup", False)
+
+    # ── Line items ────────────────────────────────────────────────────────
     line_items = []
     for item in session.get("items", []):
         if item.get("is_custom"):
@@ -481,21 +485,57 @@ async def create_draft_order(session: dict) -> dict:
                 "quantity": item["quantity"],
             })
 
+    # ── Custom attributes (matching existing store keys) ──────────────────
     custom_attrs = [
-        {"key": "Delivery Date", "value": session.get("delivery_date", "")},
-        {"key": "Delivery Window", "value": session.get("delivery_window", "")},
-        {"key": "Recipient Details", "value": session.get("recipient_details", "")},
+        {"key": "DELIVERY_METHOD", "value": "LOCAL_DELIVERY"},
+        {"key": "DATE",            "value": session.get("delivery_date", "")},
+        {"key": "SLOT",            "value": ""},   # always blank; time info goes in note
+        {"key": "SLOT_ID",         "value": ""},
+        {"key": "STORE_LOCATION",  "value": "Tienda Calzada del Valle"},
+        {"key": "LOCATION_ID",     "value": "6615bbd3154a64d9bb1e328b"},
+        {"key": "PIN_CODE",        "value": ""},
     ]
 
+    # ── Shipping address (from structured recipient fields) ───────────────
+    full_name = session.get("recipient_name", "").strip()
+    name_parts = full_name.split(" ", 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+    shipping_address = {
+        "firstName": first_name,
+        "lastName": last_name,
+        "phone": session.get("recipient_phone", ""),
+        "address1": session.get("recipient_address", ""),
+        "countryCode": "MX",
+    }
+
+    # ── Note (card message; prepend PICKUP info when applicable) ──────────
+    card_msg = session.get("card_message", "none") or "none"
+    if is_pickup:
+        window = session.get("delivery_window", "")
+        note_parts = [f"PICKUP - {window}"]
+        if card_msg.lower() != "none":
+            note_parts.append(card_msg)
+        note = "\n\n".join(note_parts)
+    else:
+        note = card_msg if card_msg.lower() != "none" else ""
+
+    # ── Tags ─────────────────────────────────────────────────────────────
+    tags = ["Pickup"] if is_pickup else ["VENTA DOMICILIO"]
+
+    # ── Assemble draft input ──────────────────────────────────────────────
     draft_input: dict[str, Any] = {
         "lineItems": line_items,
         "customAttributes": custom_attrs,
+        "shippingAddress": shipping_address,
+        "tags": tags,
     }
-
-    # Only set note when there's an actual card message
-    card_msg = session.get("card_message", "none")
-    if card_msg and card_msg.lower() != "none":
-        draft_input["note"] = card_msg
+    if note:
+        draft_input["note"] = note
+    customer_email = session.get("customer_email", "").strip()
+    if customer_email:
+        draft_input["email"] = customer_email
 
     result = await _shopify_gql(_DRAFT_ORDER_CREATE, {"input": draft_input})
     payload = result["data"]["draftOrderCreate"]
@@ -561,14 +601,20 @@ async def delete_session(phone: str) -> None:
 def new_session() -> dict:
     """Return a blank session dict at the first step."""
     return {
-        "step": "SELECT_CATEGORY",
+        "step": "SEARCH_QUERY",
         "items": [],
         "filtered_product_ids": [],
         "page": 0,
         "selected_collection_id": None,
         "delivery_date": None,
-        "delivery_window": None,
-        "recipient_details": None,
+        "delivery_window": None,   # time slot label e.g. "9:00 AM - 12:00 PM" or "Store Pickup"
+        "is_pickup": False,        # True when delivery_window == "Store Pickup"
+        # Recipient — collected as three separate fields to build shippingAddress
+        "recipient_name": None,    # e.g. "Maria Lopez"
+        "recipient_phone": None,   # e.g. "8119885392"
+        "recipient_address": None, # e.g. "Av. Constitución 100, Monterrey, 64000"
+        "customer_name": None,
+        "customer_email": None,
         "card_message": None,
         "payment_mode": None,
     }
@@ -674,6 +720,15 @@ async def handle_select_category(
 # Step 2a — SEARCH_QUERY
 # ---------------------------------------------------------------------------
 
+async def show_search_prompt(phone: str) -> None:
+    """Send the initial search prompt with escape-hatch instructions."""
+    await send_text(
+        phone,
+        "What product are you looking for? Type a keyword to search.\n\n"
+        "_Or type_ *categories* _to browse by category, or_ *custom* _to add a custom item._",
+    )
+
+
 async def handle_search_query(
     phone: str,
     session: dict,
@@ -685,6 +740,24 @@ async def handle_search_query(
     If no matches, prompt again. Otherwise move to SELECT_PRODUCT.
     """
     keyword = text.strip().lower()
+
+    # Escape hatches
+    if keyword == "categories":
+        session["step"] = "SELECT_CATEGORY"
+        await save_session(phone, session)
+        await show_category_menu(phone, session, catalog)
+        return
+
+    if keyword == "custom":
+        session["step"] = "CUSTOM_ITEM"
+        await save_session(phone, session)
+        await send_text(
+            phone,
+            "Enter the custom item in this format:\n"
+            "*Item Name - Price*\n\nExample: Custom Bouquet - 1500",
+        )
+        return
+
     matches = [
         pid
         for pid, prod in catalog["products"].items()
@@ -896,19 +969,138 @@ async def handle_item_action(
         await show_item_action(phone, session)  # re-send with updated cart
 
     elif reply_id == "BTN_ADD_MORE":
-        session["step"] = "SELECT_CATEGORY"
+        session["step"] = "SEARCH_QUERY"
         await save_session(phone, session)
-        catalog = await get_catalog()
-        await show_category_menu(phone, session, catalog)
+        await show_search_prompt(phone)
 
     elif reply_id == "BTN_ITEMS_DONE":
-        session["step"] = "SELECT_DATE"
+        session["step"] = "FILL_TEMPLATE"
         await save_session(phone, session)
-        await show_select_date(phone, session)
+        await show_order_template(phone)
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — SELECT_DATE / ENTER_DATE / SELECT_WINDOW
+# Step 4 — FILL_TEMPLATE (single-message order info collection)
+# ---------------------------------------------------------------------------
+
+_ORDER_TEMPLATE = (
+    "Por favor completa los siguientes datos y envíalos en un solo mensaje:\n\n"
+    "• Nombre del cliente:\n"
+    "• Correo del cliente:\n"
+    "• Fecha de entrega:\n\n"
+    "• Nombre de la persona que recibe el arreglo:\n"
+    "• Dirección de envío completa (calle, número, colonia, municipio y código postal):\n"
+    "• Teléfono de la persona que recibe el arreglo:\n\n"
+    "• Mensaje de la tarjeta:"
+)
+
+_REQUIRED_TEMPLATE_FIELDS = {
+    "delivery_date":    "Fecha de entrega",
+    "recipient_name":   "Nombre de la persona que recibe",
+    "recipient_phone":  "Teléfono de la persona que recibe",
+    "recipient_address":"Dirección de envío",
+}
+
+# Label patterns in the order they appear in the template.
+# Each pattern matches the label text + anything up to (and including) an optional colon.
+# The value for a field is everything between its label's end and the next label's start.
+_LABEL_PATTERNS: list[tuple[str, str]] = [
+    ("customer_name",    r"nombre del cliente[^:\n]*[:：]?"),
+    ("customer_email",   r"correo del cliente[^:\n]*[:：]?"),
+    ("delivery_date",    r"fecha de entrega[^:\n]*[:：]?"),
+    ("recipient_name",   r"nombre de la persona que recibe[^:\n]*[:：]?"),
+    ("recipient_address",r"direcci[oó]n de env[ií][oó][^:\n]*[:：]?"),
+    ("recipient_phone",  r"tel[eé]fono de la persona que recibe[^:\n]*[:：]?"),
+    ("card_message",     r"mensaje de la tarjeta[^:\n]*[:：]?"),
+]
+
+
+async def show_order_template(phone: str) -> None:
+    """Send the order info template for the staff to fill in."""
+    await send_text(phone, _ORDER_TEMPLATE)
+
+
+def _parse_template(text: str) -> dict:
+    """
+    Segment-based template parser.
+
+    Locates each known label in the text, then treats everything between
+    that label's end and the next label's start as the field value.
+    This correctly handles:
+      - values on the same line as the label
+      - values on the following line (blank after the colon)
+      - multi-line values (e.g. card messages spanning several paragraphs)
+      - completely blank values (the field is simply omitted from the result)
+    """
+    # Locate every label in the text
+    anchors: list[tuple[int, int, str]] = []  # (match_start, match_end, field)
+    for field, pattern in _LABEL_PATTERNS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            anchors.append((m.start(), m.end(), field))
+
+    if not anchors:
+        return {}
+
+    anchors.sort(key=lambda x: x[0])
+
+    result: dict[str, str] = {}
+    for i, (_, label_end, field) in enumerate(anchors):
+        next_start = anchors[i + 1][0] if i + 1 < len(anchors) else len(text)
+        raw = text[label_end:next_start]
+        # Strip surrounding whitespace, bullet characters, and zero-width chars
+        value = raw.strip().lstrip("•\u2060 ").strip()
+        if value:
+            result[field] = value
+
+    return result
+
+
+async def handle_fill_template(phone: str, session: dict, text: str) -> None:
+    """
+    Parse the filled-in order template and advance to SELECT_PAYMENT.
+    If required fields are missing, re-send the template with a note.
+    """
+    parsed = _parse_template(text)
+
+    missing = [
+        label for field, label in _REQUIRED_TEMPLATE_FIELDS.items()
+        if not parsed.get(field)
+    ]
+    if missing:
+        missing_str = ", ".join(missing)
+        await send_text(
+            phone,
+            f"Faltan los siguientes datos: *{missing_str}*\n\n"
+            "Por favor completa y envía el mensaje de nuevo:",
+        )
+        await show_order_template(phone)
+        return
+
+    session["delivery_date"]    = parsed["delivery_date"]
+    session["recipient_name"]   = parsed["recipient_name"]
+    session["recipient_phone"]  = parsed["recipient_phone"]
+    session["recipient_address"]= parsed["recipient_address"]
+    session["customer_name"]    = parsed.get("customer_name", "")
+    session["customer_email"]   = parsed.get("customer_email", "")
+    session["card_message"]     = parsed.get("card_message", "none")
+    session["delivery_window"]  = ""
+    session["is_pickup"]        = False
+    session["step"] = "SELECT_PAYMENT"
+    await save_session(phone, session)
+
+    await send_buttons(
+        phone,
+        body="¿Cómo se paga este pedido?",
+        buttons=[
+            {"id": "PAY_LINK", "title": "Payment Link"},
+            {"id": "PAY_PAID", "title": "Already Paid"},
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — SELECT_DATE / ENTER_DATE / SELECT_WINDOW  (kept for legacy sessions)
 # ---------------------------------------------------------------------------
 
 async def show_select_date(phone: str, session: dict) -> None:
@@ -997,25 +1189,52 @@ _WINDOW_LABELS = {
 
 
 async def handle_select_window(phone: str, session: dict, reply_id: str) -> None:
-    """Save the chosen delivery window and move to ENTER_RECIPIENT."""
+    """Save the chosen delivery window and move to ENTER_RECIPIENT_NAME."""
     label = _WINDOW_LABELS.get(reply_id, reply_id)
     session["delivery_window"] = label
-    session["step"] = "ENTER_RECIPIENT"
+    session["is_pickup"] = (label == "Store Pickup")
+    session["step"] = "ENTER_RECIPIENT_NAME"
     await save_session(phone, session)
-    await send_text(
-        phone,
-        "Reply with the recipient's *Name*, *Phone*, and *Delivery Address*:\n\n"
-        "Example: Maria Lopez, 5218113456789, Av. Constitución 100, Monterrey",
-    )
+    await send_text(phone, "What is the recipient's *full name*?")
 
 
 # ---------------------------------------------------------------------------
-# Step 5a — ENTER_RECIPIENT
+# Step 5a — ENTER_RECIPIENT_NAME / ENTER_RECIPIENT_PHONE / ENTER_RECIPIENT_ADDRESS
 # ---------------------------------------------------------------------------
 
-async def handle_enter_recipient(phone: str, session: dict, text: str) -> None:
-    """Save recipient details and move to ENTER_CARD."""
-    session["recipient_details"] = text.strip()
+async def handle_enter_recipient_name(phone: str, session: dict, text: str) -> None:
+    """Save recipient name and ask for phone."""
+    session["recipient_name"] = text.strip()
+    session["step"] = "ENTER_RECIPIENT_PHONE"
+    await save_session(phone, session)
+    await send_text(phone, "Recipient's *phone number*?")
+
+
+async def handle_enter_recipient_phone(phone: str, session: dict, text: str) -> None:
+    """Save recipient phone and ask for address (skip if pickup)."""
+    session["recipient_phone"] = text.strip()
+    if session.get("is_pickup"):
+        # Pickup — no delivery address needed; go straight to card message
+        session["recipient_address"] = ""
+        session["step"] = "ENTER_CARD"
+        await save_session(phone, session)
+        await send_text(
+            phone,
+            "Reply with the *gift card message* (or type _none_ if no card):",
+        )
+    else:
+        session["step"] = "ENTER_RECIPIENT_ADDRESS"
+        await save_session(phone, session)
+        await send_text(
+            phone,
+            "Delivery *address*?\n\nInclude street, city, and zip code.\n"
+            "Example: Priv. Amazonas 551, Monterrey, 66220",
+        )
+
+
+async def handle_enter_recipient_address(phone: str, session: dict, text: str) -> None:
+    """Save delivery address and move to ENTER_CARD."""
+    session["recipient_address"] = text.strip()
     session["step"] = "ENTER_CARD"
     await save_session(phone, session)
     await send_text(
@@ -1071,14 +1290,28 @@ async def show_order_summary(phone: str, session: dict) -> None:
 
     payment_label = "Payment Link" if session["payment_mode"] == "PAY_LINK" else "Already Paid"
     card_msg = session.get("card_message", "none")
+    is_pickup = session.get("is_pickup", False)
+    delivery_type = "Pickup" if is_pickup else "Delivery"
 
+    customer_name  = session.get("customer_name", "")
+    customer_email = session.get("customer_email", "")
+    customer_line  = f"  {customer_name}" + (f" — {customer_email}" if customer_email else "") + "\n"
+
+    recipient_lines = (
+        f"  {session.get('recipient_name', '')}\n"
+        f"  {session.get('recipient_phone', '')}\n"
+        + (f"  {session.get('recipient_address', '')}\n" if not is_pickup else "")
+    )
+
+    window_part = f" | {session.get('delivery_window')}" if session.get("delivery_window") else ""
     summary = (
         "*ORDER SUMMARY*\n\n"
         "*Items:*\n"
         + "\n".join(item_lines)
         + f"\n*Total: ${total:,.2f}*\n\n"
-        f"*Delivery:* {session.get('delivery_date')} | {session.get('delivery_window')}\n"
-        f"*Recipient:* {session.get('recipient_details')}\n"
+        + (f"*Customer:*\n{customer_line}" if customer_name else "")
+        + f"*{delivery_type}:* {session.get('delivery_date')}{window_part}\n"
+        f"*Recipient:*\n{recipient_lines}"
         f"*Card message:* {card_msg}\n"
         f"*Payment:* {payment_label}\n\n"
         "Confirm and create the Shopify order?"
@@ -1193,8 +1426,7 @@ async def process_message(
     if text_lower in ("new", "orden", "hola") or reply_id == "BTN_NEW_ORDER":
         session = new_session()
         await save_session(phone, session)
-        catalog = await get_catalog()
-        await show_category_menu(phone, session, catalog)
+        await show_search_prompt(phone)
         return
 
     # If there is no active session and the message is not an init trigger,
@@ -1207,7 +1439,7 @@ async def process_message(
         return
 
     # ── 4. Route to the correct step handler ─────────────────────────────
-    step = session.get("step", "SELECT_CATEGORY")
+    step = session.get("step", "SEARCH_QUERY")
     catalog = await get_catalog()  # always served from Redis cache (fast)
 
     if step == "SELECT_CATEGORY":
@@ -1225,14 +1457,23 @@ async def process_message(
     elif step == "ITEM_ACTION":
         await handle_item_action(phone, session, catalog, reply_id)
 
+    elif step == "FILL_TEMPLATE":
+        await handle_fill_template(phone, session, text)
+
     elif step in ("SELECT_DATE", "ENTER_DATE"):
         await handle_select_date(phone, session, reply_id, text)
 
     elif step == "SELECT_WINDOW":
         await handle_select_window(phone, session, reply_id)
 
-    elif step == "ENTER_RECIPIENT":
-        await handle_enter_recipient(phone, session, text)
+    elif step == "ENTER_RECIPIENT_NAME":
+        await handle_enter_recipient_name(phone, session, text)
+
+    elif step == "ENTER_RECIPIENT_PHONE":
+        await handle_enter_recipient_phone(phone, session, text)
+
+    elif step == "ENTER_RECIPIENT_ADDRESS":
+        await handle_enter_recipient_address(phone, session, text)
 
     elif step == "ENTER_CARD":
         await handle_enter_card(phone, session, text)
