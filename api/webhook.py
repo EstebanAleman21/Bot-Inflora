@@ -443,6 +443,21 @@ mutation DraftOrderCreate($input: DraftOrderInput!) {
 }
 """
 
+_DRAFT_ORDER_CALCULATE = """
+mutation DraftOrderCalculate($input: DraftOrderInput!) {
+  draftOrderCalculate(input: $input) {
+    calculatedDraftOrder {
+      availableShippingRates {
+        handle
+        title
+        price { amount }
+      }
+    }
+    userErrors { field message }
+  }
+}
+"""
+
 _DRAFT_ORDER_COMPLETE = """
 mutation DraftOrderComplete($id: ID!) {
   draftOrderComplete(id: $id) {
@@ -517,6 +532,57 @@ async def find_or_create_customer(email: str, full_name: str) -> str | None:
         return payload["customer"]["id"]
     except Exception:
         log.exception("find_or_create_customer failed for %s", email)
+        return None
+
+
+async def get_shipping_rate(session: dict) -> dict | None:
+    """
+    Call draftOrderCalculate to get the first available shipping rate for the
+    session's address. Returns {"title": str, "price": str} or None on any
+    error / no rates found.
+    """
+    try:
+        full_name = session.get("recipient_name", "").strip()
+        name_parts = full_name.split(" ", 1)
+        line_items = []
+        for item in session.get("items", []):
+            if item.get("is_custom"):
+                line_items.append({
+                    "title": item["title"],
+                    "originalUnitPrice": str(item["price"]),
+                    "quantity": item["quantity"],
+                })
+            else:
+                line_items.append({
+                    "variantId": item["variant_id"],
+                    "quantity": item["quantity"],
+                })
+
+        calc_input: dict[str, Any] = {
+            "lineItems": line_items,
+            "shippingAddress": {
+                "firstName": name_parts[0],
+                "lastName": name_parts[1] if len(name_parts) > 1 else "",
+                "address1": session.get("recipient_address", ""),
+                "countryCode": "MX",
+            },
+        }
+        data = await _shopify_gql(_DRAFT_ORDER_CALCULATE, {"input": calc_input})
+        if data.get("errors") or data.get("data") is None:
+            log.warning("draftOrderCalculate error: %s", data.get("errors"))
+            return None
+
+        rates = (
+            data["data"]["draftOrderCalculate"]
+            ["calculatedDraftOrder"]["availableShippingRates"]
+        )
+        if not rates:
+            return None
+
+        rate = rates[0]
+        return {"title": rate["title"], "price": rate["price"]["amount"]}
+    except Exception:
+        log.exception("get_shipping_rate failed")
         return None
 
 
@@ -614,6 +680,12 @@ async def create_draft_order(session: dict) -> dict:
         draft_input["email"] = customer_email
     if customer_id:
         draft_input["customerId"] = customer_id
+    shipping_rate = session.get("shipping_rate")
+    if shipping_rate:
+        draft_input["shippingLine"] = {
+            "title": shipping_rate["title"],
+            "price": shipping_rate["price"],
+        }
 
     result = await _shopify_gql(_DRAFT_ORDER_CREATE, {"input": draft_input})
     payload = result["data"]["draftOrderCreate"]
@@ -695,6 +767,7 @@ def new_session() -> dict:
         "customer_email": None,
         "card_message": None,
         "payment_mode": None,
+        "shipping_rate": None,  # {"title": str, "price": str} or None
     }
 
 
@@ -904,7 +977,7 @@ async def show_product_page(phone: str, session: dict, catalog: dict) -> None:
     """
     product_ids = session["filtered_product_ids"]
     page = session.get("page", 0)
-    page_size = 9
+    page_size = 8
 
     start = page * page_size
     end = start + page_size
@@ -930,6 +1003,12 @@ async def show_product_page(phone: str, session: dict, catalog: dict) -> None:
             "title": "Next Page",
             "description": f"Page {page + 2}",
         })
+
+    rows.append({
+        "id": "PAGE_BACK",
+        "title": "Volver",
+        "description": "Regresar a la busqueda",
+    })
 
     total = len(product_ids)
     body = (
@@ -959,6 +1038,12 @@ async def handle_select_product(
         session["page"] = session.get("page", 0) + 1
         await save_session(phone, session)
         await show_product_page(phone, session, catalog)
+        return
+
+    if reply_id == "PAGE_BACK":
+        session["step"] = "SEARCH_QUERY"
+        await save_session(phone, session)
+        await show_search_prompt(phone)
         return
 
     if reply_id.startswith("PROD_"):
@@ -1016,7 +1101,8 @@ async def show_item_action(phone: str, session: dict) -> None:
     body = (
         f"{cart_text}\n\n"
         f"Last added: *{last_item.get('title', '')}*\n"
-        "What would you like to do?"
+        "What would you like to do?\n"
+        "_Type_ *volver* _to remove last item._"
     )
 
     await send_buttons(
@@ -1271,6 +1357,20 @@ async def show_review_template(phone: str, session: dict) -> None:
         buttons=[
             {"id": "BTN_REVIEW_OK",   "title": "Confirmar"},
             {"id": "BTN_REVIEW_EDIT", "title": "Corregir"},
+            {"id": "BTN_BACK",        "title": "Volver"},
+        ],
+    )
+
+
+async def show_payment_buttons(phone: str) -> None:
+    """Send the payment method selection buttons."""
+    await send_buttons(
+        phone,
+        body="¿Cómo se paga este pedido?",
+        buttons=[
+            {"id": "PAY_LINK", "title": "Payment Link"},
+            {"id": "PAY_PAID", "title": "Already Paid"},
+            {"id": "BTN_BACK", "title": "Volver"},
         ],
     )
 
@@ -1280,14 +1380,7 @@ async def handle_review_template(phone: str, session: dict, reply_id: str) -> No
     if reply_id == "BTN_REVIEW_OK":
         session["step"] = "SELECT_PAYMENT"
         await save_session(phone, session)
-        await send_buttons(
-            phone,
-            body="¿Cómo se paga este pedido?",
-            buttons=[
-                {"id": "PAY_LINK", "title": "Payment Link"},
-                {"id": "PAY_PAID", "title": "Already Paid"},
-            ],
-        )
+        await show_payment_buttons(phone)
     elif reply_id == "BTN_REVIEW_EDIT":
         session["step"] = "FILL_TEMPLATE"
         await save_session(phone, session)
@@ -1463,8 +1556,41 @@ async def handle_enter_card(phone: str, session: dict, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def handle_select_payment(phone: str, session: dict, reply_id: str) -> None:
-    """Save payment mode and show the final order confirmation summary."""
+    """Save payment mode then calculate shipping before showing the summary."""
     session["payment_mode"] = reply_id  # "PAY_LINK" or "PAY_PAID"
+
+    rate = await get_shipping_rate(session)
+    if rate:
+        session["step"] = "CONFIRM_SHIPPING"
+        await save_session(phone, session)
+        price = float(rate["price"])
+        await send_buttons(
+            phone,
+            body=(
+                f"Envio calculado: *{rate['title']}* — *${price:,.2f}*\n\n"
+                "¿Incluir cargo de envio en el pedido?"
+            ),
+            buttons=[
+                {"id": "BTN_SHIP_YES", "title": "Si, incluir"},
+                {"id": "BTN_SHIP_NO",  "title": "No incluir"},
+                {"id": "BTN_BACK",     "title": "Volver"},
+            ],
+        )
+    else:
+        session["step"] = "CONFIRM"
+        await save_session(phone, session)
+        await show_order_summary(phone, session)
+
+
+async def handle_confirm_shipping(phone: str, session: dict, reply_id: str) -> None:
+    """Staff confirms or skips the calculated shipping charge."""
+    if reply_id == "BTN_SHIP_YES":
+        # Rate was already fetched — re-fetch to get it back (not stored yet)
+        rate = await get_shipping_rate(session)
+        session["shipping_rate"] = rate
+    else:
+        session["shipping_rate"] = None
+
     session["step"] = "CONFIRM"
     await save_session(phone, session)
     await show_order_summary(phone, session)
@@ -1513,8 +1639,10 @@ async def show_order_summary(phone: str, session: dict) -> None:
         + f"*{delivery_type}:* {session.get('delivery_date')}{window_part}\n"
         f"*Recipient:*\n{recipient_lines}"
         f"*Card message:* {card_msg}\n"
-        f"*Payment:* {payment_label}\n\n"
-        "Confirm and create the Shopify order?"
+        f"*Payment:* {payment_label}\n"
+        + (f"*Envio:* ${float(session['shipping_rate']['price']):,.2f}\n"
+           if session.get("shipping_rate") else "")
+        + "\nConfirm and create the Shopify order?"
     )
 
     await send_buttons(
@@ -1523,6 +1651,7 @@ async def show_order_summary(phone: str, session: dict) -> None:
         buttons=[
             {"id": "CONFIRM_CREATE", "title": "Create Order"},
             {"id": "CONFIRM_CANCEL", "title": "Cancel"},
+            {"id": "BTN_BACK",       "title": "Volver"},
         ],
     )
 
@@ -1587,6 +1716,79 @@ async def handle_confirm(phone: str, session: dict, reply_id: str) -> None:
 # SECTION 5 — Main message dispatcher
 # ===========================================================================
 
+async def handle_back(phone: str, session: dict) -> None:
+    """Navigate back one step, undoing the last action where applicable."""
+    step = session.get("step")
+
+    if step == "SELECT_PRODUCT":
+        session["step"] = "SEARCH_QUERY"
+        await save_session(phone, session)
+        await show_search_prompt(phone)
+
+    elif step == "ITEM_ACTION":
+        # Remove the last item that was just added
+        if session.get("items"):
+            session["items"].pop()
+        if session.get("items"):
+            await save_session(phone, session)
+            await show_item_action(phone, session)
+        else:
+            session["step"] = "SEARCH_QUERY"
+            await save_session(phone, session)
+            await show_search_prompt(phone)
+
+    elif step == "FILL_TEMPLATE":
+        if session.get("items"):
+            session["step"] = "ITEM_ACTION"
+            await save_session(phone, session)
+            await show_item_action(phone, session)
+        else:
+            session["step"] = "SEARCH_QUERY"
+            await save_session(phone, session)
+            await show_search_prompt(phone)
+
+    elif step == "REVIEW_TEMPLATE":
+        session["step"] = "FILL_TEMPLATE"
+        await save_session(phone, session)
+        await show_order_template(phone)
+
+    elif step == "SELECT_PAYMENT":
+        session["step"] = "REVIEW_TEMPLATE"
+        await save_session(phone, session)
+        await show_review_template(phone, session)
+
+    elif step == "CONFIRM_SHIPPING":
+        session["step"] = "SELECT_PAYMENT"
+        await save_session(phone, session)
+        await show_payment_buttons(phone)
+
+    elif step == "CONFIRM":
+        session["step"] = "CONFIRM_SHIPPING"
+        await save_session(phone, session)
+        # Re-trigger the shipping question
+        rate = await get_shipping_rate(session)
+        if rate:
+            price = float(rate["price"])
+            await send_buttons(
+                phone,
+                body=(
+                    f"Envio calculado: *{rate['title']}* — *${price:,.2f}*\n\n"
+                    "¿Incluir cargo de envio en el pedido?"
+                ),
+                buttons=[
+                    {"id": "BTN_SHIP_YES", "title": "Si, incluir"},
+                    {"id": "BTN_SHIP_NO",  "title": "No incluir"},
+                    {"id": "BTN_BACK",     "title": "Volver"},
+                ],
+            )
+        else:
+            session["step"] = "SELECT_PAYMENT"
+            await save_session(phone, session)
+            await show_payment_buttons(phone)
+
+    else:
+        await send_text(phone, "No hay paso anterior. Escribe *cancel* para empezar de nuevo.")
+
 async def process_message(
     phone: str,
     msg_type: str,
@@ -1642,6 +1844,11 @@ async def process_message(
     step = session.get("step", "SEARCH_QUERY")
     catalog = await get_catalog()  # always served from Redis cache (fast)
 
+    # Global back — intercept before step routing
+    if reply_id == "BTN_BACK" or text_lower in ("volver", "atras"):
+        await handle_back(phone, session)
+        return
+
     if step == "SELECT_CATEGORY":
         await handle_select_category(phone, session, catalog, reply_id or text_lower)
 
@@ -1683,6 +1890,9 @@ async def process_message(
 
     elif step == "SELECT_PAYMENT":
         await handle_select_payment(phone, session, reply_id)
+
+    elif step == "CONFIRM_SHIPPING":
+        await handle_confirm_shipping(phone, session, reply_id)
 
     elif step == "CONFIRM":
         await handle_confirm(phone, session, reply_id)
