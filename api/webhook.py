@@ -56,10 +56,6 @@ SHOPIFY_CLIENT_ID: str = os.getenv("SHOPIFY_CLIENT_ID", "")
 SHOPIFY_CLIENT_SECRET: str = os.getenv("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_STATIC_TOKEN: str = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
 
-# Parse allowlist once at startup; store as a set for O(1) lookup.
-_raw_phones = os.getenv("ALLOWED_STAFF_PHONES", "")
-ALLOWED_PHONES: set[str] = {p.strip() for p in _raw_phones.split(",") if p.strip()}
-
 # Derived URLs
 WA_API_URL = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_ID}/messages"
 SHOPIFY_GQL_URL = (
@@ -1173,12 +1169,7 @@ async def process_message(
       text:     Normalised message text (lowercase for text type, raw for others).
       reply_id: Interactive reply id (empty string for plain text).
     """
-    # ── 1. Staff authorisation ────────────────────────────────────────────
-    if phone not in ALLOWED_PHONES:
-        log.warning("Ignored message from unauthorised number: %s", phone)
-        return  # Silently ignore — do not reveal the bot to unknown senders
-
-    # ── 2. Global commands (always available, bypass state machine) ───────
+    # ── 1. Global commands (always available, bypass state machine) ───────
     text_lower = text.lower().strip()
 
     if text_lower in ("cancel", "salir"):
