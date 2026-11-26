@@ -459,8 +459,8 @@ mutation DraftOrderCalculate($input: DraftOrderInput!) {
 """
 
 _DRAFT_ORDER_COMPLETE = """
-mutation DraftOrderComplete($id: ID!) {
-  draftOrderComplete(id: $id) {
+mutation DraftOrderComplete($id: ID!, $paymentPending: Boolean) {
+  draftOrderComplete(id: $id, paymentPending: $paymentPending) {
     draftOrder {
       order {
         id
@@ -709,7 +709,7 @@ async def complete_draft_order(draft_order_id: str) -> str:
     Returns the resulting order name (e.g. "#1045").
     Raises ValueError on userErrors.
     """
-    result = await _shopify_gql(_DRAFT_ORDER_COMPLETE, {"id": draft_order_id})
+    result = await _shopify_gql(_DRAFT_ORDER_COMPLETE, {"id": draft_order_id, "paymentPending": True})
     payload = result["data"]["draftOrderComplete"]
 
     if payload["userErrors"]:
@@ -1369,7 +1369,7 @@ async def show_payment_buttons(phone: str) -> None:
         body="¿Cómo se paga este pedido?",
         buttons=[
             {"id": "PAY_LINK", "title": "Payment Link"},
-            {"id": "PAY_PAID", "title": "Already Paid"},
+            {"id": "PAY_PENDING", "title": "Pending Payment"},
             {"id": "BTN_BACK", "title": "Volver"},
         ],
     )
@@ -1546,7 +1546,7 @@ async def handle_enter_card(phone: str, session: dict, text: str) -> None:
         body="How is this order being paid?",
         buttons=[
             {"id": "PAY_LINK", "title": "Payment Link"},
-            {"id": "PAY_PAID", "title": "Already Paid"},
+            {"id": "PAY_PENDING", "title": "Pending Payment"},
         ],
     )
 
@@ -1557,7 +1557,7 @@ async def handle_enter_card(phone: str, session: dict, text: str) -> None:
 
 async def handle_select_payment(phone: str, session: dict, reply_id: str) -> None:
     """Save payment mode then calculate shipping before showing the summary."""
-    session["payment_mode"] = reply_id  # "PAY_LINK" or "PAY_PAID"
+    session["payment_mode"] = reply_id  # "PAY_LINK" or "PAY_PENDING"
 
     rate = await get_shipping_rate(session)
     if rate:
@@ -1610,7 +1610,7 @@ async def show_order_summary(phone: str, session: dict) -> None:
         total += sub
         item_lines.append(f"  • {item['title']} x{qty} = ${sub:,.2f}")
 
-    payment_label = "Payment Link" if session["payment_mode"] == "PAY_LINK" else "Already Paid"
+    payment_label = "Payment Link" if session["payment_mode"] == "PAY_LINK" else "Pending Payment"
     card_msg = session.get("card_message", "none")
     is_pickup = session.get("is_pickup", False)
     delivery_type = "Pickup" if is_pickup else "Delivery"
@@ -1683,7 +1683,7 @@ async def handle_confirm(phone: str, session: dict, reply_id: str) -> None:
 
     payment_mode = session.get("payment_mode")
 
-    if payment_mode == "PAY_PAID":
+    if payment_mode == "PAY_PENDING":
         # Complete the draft into a finalised paid order
         try:
             order_name = await complete_draft_order(draft["draftOrderId"])
@@ -1693,7 +1693,7 @@ async def handle_confirm(phone: str, session: dict, reply_id: str) -> None:
             return
 
         confirmation = (
-            f"Order *{order_name}* created and marked as paid in Shopify!\n\n"
+            f"Order *{order_name}* created with pending payment in Shopify!\n\n"
             "Type *new* to start another order."
         )
     else:
