@@ -226,6 +226,17 @@ async def _get_shopify_token() -> str:
     if SHOPIFY_STATIC_TOKEN:
         return SHOPIFY_STATIC_TOKEN
 
+    # Validate required config before attempting a network call
+    missing = [
+        name for name, val in [
+            ("SHOPIFY_STORE_DOMAIN", SHOPIFY_DOMAIN),
+            ("SHOPIFY_CLIENT_ID", SHOPIFY_CLIENT_ID),
+            ("SHOPIFY_CLIENT_SECRET", SHOPIFY_CLIENT_SECRET),
+        ] if not val
+    ]
+    if missing:
+        raise ValueError(f"Missing env vars: {', '.join(missing)}")
+
     redis = get_redis()
 
     # Check Redis cache first
