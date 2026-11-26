@@ -1268,9 +1268,10 @@ app = FastAPI(title="Inflora WhatsApp Order Bot")
 async def health(check: str = "") -> JSONResponse:
     """
     Health check endpoint.
-    GET /api/health             → basic liveness (no external calls)
-    GET /api/health?check=redis   → also pings Upstash Redis
-    GET /api/health?check=shopify → also verifies Shopify token fetch
+    GET /api/health                   → basic liveness (no external calls)
+    GET /api/health?check=redis       → also pings Upstash Redis
+    GET /api/health?check=shopify     → also verifies Shopify token fetch
+    GET /api/health?check=shopify_gql → fires a real GQL query (shop name + first product)
     """
     result: dict = {"status": "ok", "service": "inflora-bot"}
 
@@ -1288,6 +1289,21 @@ async def health(check: str = "") -> JSONResponse:
             result["shopify"] = "ok" if token else "empty token"
         except Exception as exc:
             result["shopify"] = f"error: {exc}"
+            result["status"] = "degraded"
+
+    elif check == "shopify_gql":
+        try:
+            data = await _shopify_gql(
+                "{ shop { name } products(first: 1) { edges { node { title } } } }"
+            )
+            shop_name = data["data"]["shop"]["name"]
+            edges = data["data"]["products"]["edges"]
+            first_product = edges[0]["node"]["title"] if edges else "no products"
+            result["shopify_gql"] = "ok"
+            result["shop"] = shop_name
+            result["first_product"] = first_product
+        except Exception as exc:
+            result["shopify_gql"] = f"error: {exc}"
             result["status"] = "degraded"
 
     return JSONResponse(result)
