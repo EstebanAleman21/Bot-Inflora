@@ -1083,6 +1083,33 @@ async def show_order_template(phone: str) -> None:
     await send_text(phone, _ORDER_TEMPLATE)
 
 
+# Invisible / zero-width Unicode characters WhatsApp embeds in messages.
+_INVISIBLE_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00a0]+")
+# Fields whose values may legitimately span multiple lines.
+_MULTILINE_FIELDS = {"card_message"}
+
+
+def _clean_field(raw: str, field: str) -> str:
+    """
+    Clean a raw segment extracted from the template:
+      1. Remove invisible/zero-width Unicode characters.
+      2. Strip surrounding whitespace and leading bullet chars.
+      3. For single-line fields, return only the first non-empty line so that
+         stray bullets or newlines from the template don't bleed into values.
+    """
+    cleaned = _INVISIBLE_RE.sub(" ", raw)
+    cleaned = cleaned.strip().lstrip("• ").strip()
+
+    if field not in _MULTILINE_FIELDS:
+        for line in cleaned.splitlines():
+            line = line.strip().lstrip("• ").strip()
+            if line:
+                return line
+        return ""
+
+    return cleaned
+
+
 def _parse_template(text: str) -> dict:
     """
     Segment-based template parser.
@@ -1095,8 +1122,7 @@ def _parse_template(text: str) -> dict:
       - multi-line values (e.g. card messages spanning several paragraphs)
       - completely blank values (the field is simply omitted from the result)
     """
-    # Locate every label in the text
-    anchors: list[tuple[int, int, str]] = []  # (match_start, match_end, field)
+    anchors: list[tuple[int, int, str]] = []
     for field, pattern in _LABEL_PATTERNS:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
@@ -1111,8 +1137,7 @@ def _parse_template(text: str) -> dict:
     for i, (_, label_end, field) in enumerate(anchors):
         next_start = anchors[i + 1][0] if i + 1 < len(anchors) else len(text)
         raw = text[label_end:next_start]
-        # Strip surrounding whitespace, bullet characters, and zero-width chars
-        value = raw.strip().lstrip("•\u2060 ").strip()
+        value = _clean_field(raw, field)
         if value:
             result[field] = value
 
@@ -1397,14 +1422,18 @@ async def show_order_summary(phone: str, session: dict) -> None:
     is_pickup = session.get("is_pickup", False)
     delivery_type = "Pickup" if is_pickup else "Delivery"
 
-    customer_name  = session.get("customer_name", "")
-    customer_email = session.get("customer_email", "")
+    def _s(key: str) -> str:
+        """Get a session string value, stripped of invisible chars."""
+        return _INVISIBLE_RE.sub("", session.get(key, "") or "").strip()
+
+    customer_name  = _s("customer_name")
+    customer_email = _s("customer_email")
     customer_line  = f"  {customer_name}" + (f" — {customer_email}" if customer_email else "") + "\n"
 
     recipient_lines = (
-        f"  {session.get('recipient_name', '')}\n"
-        f"  {session.get('recipient_phone', '')}\n"
-        + (f"  {session.get('recipient_address', '')}\n" if not is_pickup else "")
+        f"  {_s('recipient_name')}\n"
+        f"  {_s('recipient_phone')}\n"
+        + (f"  {_s('recipient_address')}\n" if not is_pickup else "")
     )
 
     window_part = f" | {session.get('delivery_window')}" if session.get("delivery_window") else ""
@@ -1785,7 +1814,7 @@ async def receive_webhook(request: Request) -> JSONResponse:
         # ── Dispatch ──────────────────────────────────────────────────────
         await process_message(phone, msg_type, text, reply_id)
 
-    except Exception as exc:
+    except Exception:
         log.exception("Unhandled error processing webhook")
         # Attempt to notify the staff member so they know something went wrong.
         # This best-effort send must not raise (we're already in the except block).
