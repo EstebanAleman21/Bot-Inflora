@@ -535,6 +535,44 @@ async def find_or_create_customer(email: str, full_name: str) -> str | None:
         return None
 
 
+def _parse_mx_address(full_address: str) -> dict:
+    """
+    Split a free-text Mexican address into Shopify shippingAddress fields.
+
+    Expected format (most common):
+      "Street Number, Colonia, ZIP City, State[, Mexico]"
+    Example:
+      "Rio Mississippi 267, Del Valle, 66220 San Pedro Garza García, N.L., Mexico"
+      → address1="Rio Mississippi 267, Del Valle"
+        zip="66220"  city="San Pedro Garza García"  province="N.L."
+
+    Uses the 5-digit postal code as the anchor.  If not found, the whole
+    string goes into address1 and city/province/zip are left empty.
+    """
+    s = full_address.strip()
+
+    # Remove trailing country label (", Mexico" / "Mexico")
+    s = re.sub(r",?\s*M[eé]xico\s*$", "", s, flags=re.IGNORECASE).strip()
+
+    zip_match = re.search(r"\b(\d{5})\b", s)
+    if not zip_match:
+        return {"address1": s, "city": "", "province": "", "zip": ""}
+
+    zip_code = zip_match.group(1)
+
+    # Everything before the zip → address1 (strip trailing comma/space)
+    address1 = s[: zip_match.start()].strip().rstrip(", ").strip()
+
+    # Everything after the zip → "City, State"
+    after_zip = s[zip_match.end():].strip().lstrip(", ").strip()
+    parts = [p.strip() for p in after_zip.split(",") if p.strip()]
+
+    city     = parts[0] if parts else ""
+    province = parts[1] if len(parts) > 1 else ""
+
+    return {"address1": address1, "city": city, "province": province, "zip": zip_code}
+
+
 async def get_shipping_rate(session: dict) -> dict | None:
     """
     Call draftOrderCalculate to get the first available shipping rate for the
@@ -558,12 +596,16 @@ async def get_shipping_rate(session: dict) -> dict | None:
                     "quantity": item["quantity"],
                 })
 
+        parsed_addr = _parse_mx_address(session.get("recipient_address", ""))
         calc_input: dict[str, Any] = {
             "lineItems": line_items,
             "shippingAddress": {
                 "firstName": name_parts[0],
                 "lastName": name_parts[1] if len(name_parts) > 1 else "",
-                "address1": session.get("recipient_address", ""),
+                "address1": parsed_addr["address1"],
+                "city": parsed_addr["city"],
+                "province": parsed_addr["province"],
+                "zip": parsed_addr["zip"],
                 "countryCode": "MX",
             },
         }
@@ -630,11 +672,15 @@ async def create_draft_order(session: dict) -> dict:
     first_name = name_parts[0]
     last_name = name_parts[1] if len(name_parts) > 1 else ""
 
+    parsed_addr = _parse_mx_address(session.get("recipient_address", ""))
     shipping_address = {
         "firstName": first_name,
         "lastName": last_name,
         "phone": session.get("recipient_phone", ""),
-        "address1": session.get("recipient_address", ""),
+        "address1": parsed_addr["address1"],
+        "city": parsed_addr["city"],
+        "province": parsed_addr["province"],
+        "zip": parsed_addr["zip"],
         "countryCode": "MX",
     }
 
