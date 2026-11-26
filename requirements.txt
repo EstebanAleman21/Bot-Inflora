@@ -1,0 +1,5 @@
+fastapi
+httpx
+upstash-redis
+mangum
+python-dotenv
