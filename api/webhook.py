@@ -1223,6 +1223,10 @@ def _parse_template(text: str) -> dict:
       - multi-line values (e.g. card messages spanning several paragraphs)
       - completely blank values (the field is simply omitted from the result)
     """
+    # Strip invisible chars from the whole text so they don't break label matching.
+    # WhatsApp embeds U+2060 and similar inside copied text, not just at value edges.
+    text = _INVISIBLE_RE.sub("", text)
+
     anchors: list[tuple[int, int, str]] = []
     for field, pattern in _LABEL_PATTERNS:
         m = re.search(pattern, text, re.IGNORECASE)
