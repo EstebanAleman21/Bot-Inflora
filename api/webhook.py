@@ -457,6 +457,63 @@ mutation DraftOrderComplete($id: ID!) {
 }
 """
 
+_CUSTOMER_SEARCH = """
+query CustomerSearch($query: String!) {
+  customers(first: 1, query: $query) {
+    edges {
+      node {
+        id
+      }
+    }
+  }
+}
+"""
+
+_CUSTOMER_CREATE = """
+mutation CustomerCreate($input: CustomerInput!) {
+  customerCreate(input: $input) {
+    customer {
+      id
+    }
+    userErrors { field message }
+  }
+}
+"""
+
+
+async def find_or_create_customer(email: str, full_name: str) -> str | None:
+    """
+    Look up a Shopify customer by email. If found, return their GID.
+    If not found, create them and return the new GID.
+    Returns None if email is blank or on any error (order creation continues without customerId).
+    """
+    if not email:
+        return None
+    try:
+        data = await _shopify_gql(_CUSTOMER_SEARCH, {"query": f"email:{email}"})
+        edges = data["data"]["customers"]["edges"]
+        if edges:
+            return edges[0]["node"]["id"]
+
+        # Not found — create
+        name_parts = full_name.strip().split(" ", 1)
+        customer_input: dict[str, Any] = {
+            "email": email,
+            "firstName": name_parts[0],
+        }
+        if len(name_parts) > 1:
+            customer_input["lastName"] = name_parts[1]
+
+        result = await _shopify_gql(_CUSTOMER_CREATE, {"input": customer_input})
+        payload = result["data"]["customerCreate"]
+        if payload["userErrors"]:
+            log.warning("customerCreate errors: %s", payload["userErrors"])
+            return None
+        return payload["customer"]["id"]
+    except Exception:
+        log.exception("find_or_create_customer failed for %s", email)
+        return None
+
 
 async def create_draft_order(session: dict) -> dict:
     """
@@ -524,6 +581,11 @@ async def create_draft_order(session: dict) -> dict:
     # ── Tags ─────────────────────────────────────────────────────────────
     tags = ["Pickup"] if is_pickup else ["VENTA DOMICILIO"]
 
+    # ── Resolve Shopify customer (find or create by email) ────────────────
+    customer_email = session.get("customer_email", "").strip()
+    customer_name  = session.get("customer_name", "").strip()
+    customer_id    = await find_or_create_customer(customer_email, customer_name)
+
     # ── Assemble draft input ──────────────────────────────────────────────
     draft_input: dict[str, Any] = {
         "lineItems": line_items,
@@ -533,9 +595,10 @@ async def create_draft_order(session: dict) -> dict:
     }
     if note:
         draft_input["note"] = note
-    customer_email = session.get("customer_email", "").strip()
     if customer_email:
         draft_input["email"] = customer_email
+    if customer_id:
+        draft_input["customerId"] = customer_id
 
     result = await _shopify_gql(_DRAFT_ORDER_CREATE, {"input": draft_input})
     payload = result["data"]["draftOrderCreate"]
@@ -1086,17 +1149,58 @@ async def handle_fill_template(phone: str, session: dict, text: str) -> None:
     session["card_message"]     = parsed.get("card_message", "none")
     session["delivery_window"]  = ""
     session["is_pickup"]        = False
-    session["step"] = "SELECT_PAYMENT"
+    session["step"] = "REVIEW_TEMPLATE"
     await save_session(phone, session)
+    await show_review_template(phone, session)
+
+
+async def show_review_template(phone: str, session: dict) -> None:
+    """Show the parsed order info for staff to verify before payment."""
+    card_preview = session.get("card_message", "none") or "none"
+    if len(card_preview) > 80:
+        card_preview = card_preview[:80] + "…"
+
+    customer_name  = session.get("customer_name", "")
+    customer_email = session.get("customer_email", "")
+    customer_line  = customer_name + (f" ({customer_email})" if customer_email else "")
+
+    lines = ["*Verifica la información:*\n"]
+    if customer_line:
+        lines.append(f"Cliente: {customer_line}")
+    lines.append(f"Fecha: {session.get('delivery_date', '')}")
+    lines.append(f"Recibe: {session.get('recipient_name', '')}")
+    lines.append(f"Tel: {session.get('recipient_phone', '')}")
+    lines.append(f"Direccion: {session.get('recipient_address', '')}")
+    lines.append(f"Tarjeta: {card_preview}")
 
     await send_buttons(
         phone,
-        body="¿Cómo se paga este pedido?",
+        body="\n".join(lines),
         buttons=[
-            {"id": "PAY_LINK", "title": "Payment Link"},
-            {"id": "PAY_PAID", "title": "Already Paid"},
+            {"id": "BTN_REVIEW_OK",   "title": "Confirmar"},
+            {"id": "BTN_REVIEW_EDIT", "title": "Corregir"},
         ],
     )
+
+
+async def handle_review_template(phone: str, session: dict, reply_id: str) -> None:
+    """Handle the review confirmation or edit request."""
+    if reply_id == "BTN_REVIEW_OK":
+        session["step"] = "SELECT_PAYMENT"
+        await save_session(phone, session)
+        await send_buttons(
+            phone,
+            body="¿Cómo se paga este pedido?",
+            buttons=[
+                {"id": "PAY_LINK", "title": "Payment Link"},
+                {"id": "PAY_PAID", "title": "Already Paid"},
+            ],
+        )
+    elif reply_id == "BTN_REVIEW_EDIT":
+        session["step"] = "FILL_TEMPLATE"
+        await save_session(phone, session)
+        await send_text(phone, "Sin problema, envía la información corregida:")
+        await show_order_template(phone)
 
 
 # ---------------------------------------------------------------------------
@@ -1459,6 +1563,9 @@ async def process_message(
 
     elif step == "FILL_TEMPLATE":
         await handle_fill_template(phone, session, text)
+
+    elif step == "REVIEW_TEMPLATE":
+        await handle_review_template(phone, session, reply_id)
 
     elif step in ("SELECT_DATE", "ENTER_DATE"):
         await handle_select_date(phone, session, reply_id, text)
