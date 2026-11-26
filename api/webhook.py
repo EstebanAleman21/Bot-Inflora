@@ -49,8 +49,12 @@ WA_PHONE_ID: str = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WA_API_VERSION: str = os.getenv("WHATSAPP_API_VERSION", "v21.0")
 
 SHOPIFY_DOMAIN: str = os.getenv("SHOPIFY_STORE_DOMAIN", "")
-SHOPIFY_TOKEN: str = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
 SHOPIFY_VERSION: str = os.getenv("SHOPIFY_API_VERSION", "2025-01")
+# New Dev Dashboard apps use client_credentials (expiring tokens).
+# Legacy admin-created apps can still set SHOPIFY_ADMIN_TOKEN as a static fallback.
+SHOPIFY_CLIENT_ID: str = os.getenv("SHOPIFY_CLIENT_ID", "")
+SHOPIFY_CLIENT_SECRET: str = os.getenv("SHOPIFY_CLIENT_SECRET", "")
+SHOPIFY_STATIC_TOKEN: str = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
 
 # Parse allowlist once at startup; store as a set for O(1) lookup.
 _raw_phones = os.getenv("ALLOWED_STAFF_PHONES", "")
@@ -207,13 +211,58 @@ async def send_list(
 # SECTION 2 — Shopify GraphQL helpers
 # ===========================================================================
 
+async def _get_shopify_token() -> str:
+    """
+    Return a valid Shopify Admin API access token.
+
+    Strategy (in order):
+      1. If SHOPIFY_ADMIN_TOKEN is set (legacy static token), use it directly.
+      2. Otherwise use SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET to request a
+         short-lived token via the OAuth2 client_credentials grant. The token
+         is cached in Redis under "shopify:token" with a TTL 60s shorter than
+         its actual expiry so we refresh it before it goes stale.
+    """
+    # Static token path (legacy admin-created apps)
+    if SHOPIFY_STATIC_TOKEN:
+        return SHOPIFY_STATIC_TOKEN
+
+    redis = get_redis()
+
+    # Check Redis cache first
+    cached = await redis.get("shopify:token")
+    if cached:
+        return cached
+
+    # Fetch a fresh token via client_credentials
+    token_url = f"https://{SHOPIFY_DOMAIN}/admin/oauth/access_token"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            token_url,
+            data={
+                "client_id": SHOPIFY_CLIENT_ID,
+                "client_secret": SHOPIFY_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    token: str = data["access_token"]
+    # Cache with a 60s safety buffer before actual expiry (default ~24h)
+    ttl = int(data.get("expires_in", 86400)) - 60
+    await redis.set("shopify:token", token, ex=ttl)
+    log.info("Fetched fresh Shopify access token (TTL %ds)", ttl)
+    return token
+
+
 async def _shopify_gql(query: str, variables: dict | None = None) -> dict:
     """
     Execute a Shopify Admin GraphQL request and return the parsed response.
     Raises httpx.HTTPStatusError on non-2xx responses.
     """
+    token = await _get_shopify_token()
     headers = {
-        "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+        "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
     }
     payload: dict[str, Any] = {"query": query}
@@ -1208,8 +1257,9 @@ app = FastAPI(title="Inflora WhatsApp Order Bot")
 async def health(check: str = "") -> JSONResponse:
     """
     Health check endpoint.
-    GET /api/health          → basic liveness check (no external calls)
-    GET /api/health?check=redis → also pings Upstash Redis
+    GET /api/health             → basic liveness (no external calls)
+    GET /api/health?check=redis   → also pings Upstash Redis
+    GET /api/health?check=shopify → also verifies Shopify token fetch
     """
     result: dict = {"status": "ok", "service": "inflora-bot"}
 
@@ -1219,6 +1269,14 @@ async def health(check: str = "") -> JSONResponse:
             result["redis"] = "ok" if pong else "unexpected response"
         except Exception as exc:
             result["redis"] = f"error: {exc}"
+            result["status"] = "degraded"
+
+    elif check == "shopify":
+        try:
+            token = await _get_shopify_token()
+            result["shopify"] = "ok" if token else "empty token"
+        except Exception as exc:
+            result["shopify"] = f"error: {exc}"
             result["status"] = "degraded"
 
     return JSONResponse(result)
