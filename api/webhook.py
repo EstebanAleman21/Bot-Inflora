@@ -995,7 +995,7 @@ async def handle_search_query(
     # SKU exact match (any variant) — go straight to that product
     for pid, prod in catalog["products"].items():
         for v in prod.get("variants", []):
-            if v.get("sku", "").lower() == keyword:
+            if (v.get("sku") or "").lower() == keyword:
                 session["filtered_product_ids"] = [pid]
                 session["page"] = 0
                 session["step"] = "SELECT_PRODUCT"
