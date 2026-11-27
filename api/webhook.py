@@ -56,6 +56,14 @@ SHOPIFY_CLIENT_ID: str = os.getenv("SHOPIFY_CLIENT_ID", "")
 SHOPIFY_CLIENT_SECRET: str = os.getenv("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_STATIC_TOKEN: str = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
 
+BANK_IMAGE_URL: str = (
+    os.getenv("BANK_IMAGE_URL")
+    or (
+        f"https://{os.getenv('VERCEL_PROJECT_PRODUCTION_URL')}/image.png"
+        if os.getenv("VERCEL_PROJECT_PRODUCTION_URL") else ""
+    )
+)
+
 # Derived URLs
 WA_API_URL = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_ID}/messages"
 SHOPIFY_GQL_URL = (
@@ -154,6 +162,19 @@ async def send_buttons(to: str, body: str, buttons: list[dict]) -> None:
             "action": {"buttons": safe_buttons},
         },
     })
+
+
+async def send_image(to: str, url: str, caption: str = "") -> None:
+    """Send an image message via URL. The URL must be publicly accessible HTTPS."""
+    payload: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": {"link": url},
+    }
+    if caption:
+        payload["image"]["caption"] = caption
+    await _wa_post(payload)
 
 
 async def send_list(
@@ -1934,10 +1955,30 @@ async def handle_confirm(phone: str, session: dict, reply_id: str) -> None:
             await delete_session(phone)
             return
 
-        confirmation = f"Orden *{completed['name']}* creada con pago pendiente en Shopify!"
+        await delete_session(phone)
+        await send_text(
+            phone,
+            f"Orden *{completed['name']}* creada con pago pendiente en Shopify!\n\n"
+            "Escribe *new* para empezar otra orden.",
+        )
         if completed.get("statusUrl"):
-            confirmation += f"\n\n📦 *Link de seguimiento (cliente):*\n{completed['statusUrl']}"
-        confirmation += "\n\nEscribe *new* para empezar otra orden."
+            await send_text(phone, f"📦 Link de seguimiento del cliente:\n{completed['statusUrl']}")
+        if BANK_IMAGE_URL:
+            items_total = sum(
+                float(item["price"]) * item["quantity"] for item in session["items"]
+            )
+            shipping = (
+                float(session["shipping_rate"]["price"])
+                if session.get("shipping_rate") else 0
+            )
+            grand_total = items_total + shipping
+            caption = (
+                f"Te comparto la cuenta, como referencia podrías poner el número de tu "
+                f"pedido por favor {completed['name']}\n\n"
+                f"El total de tu pedido sería de ${grand_total:,.2f}"
+            )
+            await send_image(phone, BANK_IMAGE_URL, caption)
+        return
     else:
         # PAY_LINK — share the invoice URL with the staff member
         confirmation = (
