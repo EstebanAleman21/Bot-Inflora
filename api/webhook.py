@@ -466,7 +466,6 @@ mutation DraftOrderComplete($id: ID!, $paymentPending: Boolean) {
         id
         name
         statusUrl
-        packingSlipUrl
       }
     }
     userErrors { field message }
@@ -767,7 +766,6 @@ async def complete_draft_order(draft_order_id: str) -> dict:
     return {
         "name": order["name"],
         "statusUrl": order.get("statusUrl", ""),
-        "packingSlipUrl": order.get("packingSlipUrl", ""),
     }
 
 
@@ -1936,8 +1934,6 @@ async def handle_confirm(phone: str, session: dict, reply_id: str) -> None:
         confirmation = f"Orden *{completed['name']}* creada con pago pendiente en Shopify!"
         if completed.get("statusUrl"):
             confirmation += f"\n\n📦 *Link de seguimiento (cliente):*\n{completed['statusUrl']}"
-        if completed.get("packingSlipUrl"):
-            confirmation += f"\n\n🖨️ *Packing slip:*\n{completed['packingSlipUrl']}"
         confirmation += "\n\nEscribe *new* para empezar otra orden."
     else:
         # PAY_LINK — share the invoice URL with the staff member
