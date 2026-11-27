@@ -2088,40 +2088,66 @@ async def debug_shipping(zip: str = "", city: str = "San Pedro Garza García") -
 @app.get("/api/debug/delivery")
 async def debug_delivery() -> JSONResponse:
     """
-    Debug endpoint — fetches Shopify locations and their local delivery settings.
+    Debug endpoint — fetches all Shopify delivery profiles with zones and rates.
     GET /api/debug/delivery
     """
-    try:
-        token = await _get_shopify_token()
-        headers = {
-            "X-Shopify-Access-Token": token,
-            "Content-Type": "application/json",
+    query = """
+    query {
+      deliveryProfiles(first: 10) {
+        edges {
+          node {
+            id
+            name
+            isDefault
+            profileLocationGroups {
+              locationGroupZones(first: 30) {
+                edges {
+                  node {
+                    zone {
+                      id
+                      name
+                      countries {
+                        name
+                        code { countryCode }
+                        provinces { name code }
+                      }
+                    }
+                    methodDefinitions(first: 10) {
+                      edges {
+                        node {
+                          id
+                          name
+                          active
+                          rateProvider {
+                            __typename
+                            ... on DeliveryRateDefinition {
+                              price { amount currencyCode }
+                            }
+                          }
+                          methodConditions {
+                            field
+                            operator
+                            conditionCriteria {
+                              __typename
+                              ... on MoneyV2 { amount currencyCode }
+                              ... on Weight { value unit }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
-        base = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_VERSION}"
-
-        # Step 1: get all locations
-        async with httpx.AsyncClient(timeout=15) as client:
-            locs_resp = await client.get(f"{base}/locations.json", headers=headers)
-            locs_resp.raise_for_status()
-            locations = locs_resp.json().get("locations", [])
-
-        # Step 2: get local delivery settings for each location
-        results = []
-        async with httpx.AsyncClient(timeout=15) as client:
-            for loc in locations:
-                loc_id = loc["id"]
-                r = await client.get(
-                    f"{base}/locations/{loc_id}/local_delivery_settings.json",
-                    headers=headers,
-                )
-                results.append({
-                    "location_id": loc_id,
-                    "location_name": loc.get("name"),
-                    "status": r.status_code,
-                    "body": r.json(),
-                })
-
-        return JSONResponse({"locations": results})
+      }
+    }
+    """
+    try:
+        data = await _shopify_gql(query)
+        return JSONResponse(data)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
