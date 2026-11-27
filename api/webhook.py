@@ -2085,6 +2085,47 @@ async def debug_shipping(zip: str = "", city: str = "San Pedro Garza García") -
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.get("/api/debug/delivery")
+async def debug_delivery() -> JSONResponse:
+    """
+    Debug endpoint — fetches Shopify locations and their local delivery settings.
+    GET /api/debug/delivery
+    """
+    try:
+        token = await _get_shopify_token()
+        headers = {
+            "X-Shopify-Access-Token": token,
+            "Content-Type": "application/json",
+        }
+        base = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_VERSION}"
+
+        # Step 1: get all locations
+        async with httpx.AsyncClient(timeout=15) as client:
+            locs_resp = await client.get(f"{base}/locations.json", headers=headers)
+            locs_resp.raise_for_status()
+            locations = locs_resp.json().get("locations", [])
+
+        # Step 2: get local delivery settings for each location
+        results = []
+        async with httpx.AsyncClient(timeout=15) as client:
+            for loc in locations:
+                loc_id = loc["id"]
+                r = await client.get(
+                    f"{base}/locations/{loc_id}/local_delivery_settings.json",
+                    headers=headers,
+                )
+                results.append({
+                    "location_id": loc_id,
+                    "location_name": loc.get("name"),
+                    "status": r.status_code,
+                    "body": r.json(),
+                })
+
+        return JSONResponse({"locations": results})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.get("/api/webhook")
 async def verify_webhook(request: Request) -> Response:
     """
