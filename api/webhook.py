@@ -465,7 +465,7 @@ mutation DraftOrderComplete($id: ID!, $paymentPending: Boolean) {
       order {
         id
         name
-        statusUrl
+        statusPageUrl
       }
     }
     userErrors { field message }
@@ -768,7 +768,7 @@ async def complete_draft_order(draft_order_id: str) -> dict:
     order = payload["draftOrder"]["order"]
     return {
         "name": order["name"],
-        "statusUrl": order.get("statusUrl", ""),
+        "statusUrl": order.get("statusPageUrl", ""),
     }
 
 
