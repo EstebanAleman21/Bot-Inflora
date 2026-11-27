@@ -1194,7 +1194,8 @@ async def show_variant_selection(phone: str, product: dict) -> None:
             phone,
             body=f"*{title}*\n\nSelecciona una variante:",
             button_text="Ver opciones",
-            sections=[{"title": "Variantes", "rows": rows}],
+            section_title="Variantes",
+            rows=rows,
         )
 
 
