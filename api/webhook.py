@@ -2080,13 +2080,7 @@ async def debug_shipping(zip: str = "", city: str = "San Pedro Garza García") -
     }
     try:
         data = await _shopify_gql(_DRAFT_ORDER_CALCULATE, {"input": calc_input})
-        if data.get("errors") or data.get("data") is None:
-            return JSONResponse({"error": data.get("errors")}, status_code=500)
-        rates = (
-            data["data"]["draftOrderCalculate"]
-            ["calculatedDraftOrder"]["availableShippingRates"]
-        )
-        return JSONResponse({"zip": zip, "city": city, "rates": rates})
+        return JSONResponse({"zip": zip, "city": city, "raw": data})
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
