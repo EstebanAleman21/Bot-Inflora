@@ -323,6 +323,7 @@ query GetProducts($cursor: String) {
             node {
               id
               title
+              sku
               price
             }
           }
@@ -400,7 +401,7 @@ async def get_catalog(force_refresh: bool = False) -> dict:
                 continue  # skip products with no variants
 
             all_variants = [
-                {"id": v["node"]["id"], "title": v["node"]["title"], "price": v["node"]["price"]}
+                {"id": v["node"]["id"], "title": v["node"]["title"], "sku": v["node"].get("sku", ""), "price": v["node"]["price"]}
                 for v in variant_edges
             ]
             col_ids = [c["node"]["id"] for c in node["collections"]["edges"]]
@@ -991,6 +992,17 @@ async def handle_search_query(
         )
         return
 
+    # SKU exact match (any variant) — go straight to that product
+    for pid, prod in catalog["products"].items():
+        for v in prod.get("variants", []):
+            if v.get("sku", "").lower() == keyword:
+                session["filtered_product_ids"] = [pid]
+                session["page"] = 0
+                session["step"] = "SELECT_PRODUCT"
+                await save_session(phone, session)
+                await show_product_page(phone, session, catalog)
+                return
+
     matches = [
         pid
         for pid, prod in catalog["products"].items()
@@ -1314,6 +1326,7 @@ async def handle_item_action(
 _ORDER_TEMPLATE = (
     "Por favor completa los siguientes datos y envíalos en un solo mensaje:\n\n"
     "• Nombre del cliente:\n"
+    "• Teléfono del cliente:\n"
     "• Correo del cliente:\n"
     "• Fecha de entrega (YYYY-MM-DD):\n\n"
     "• Nombre de la persona que recibe el arreglo:\n"
@@ -1336,6 +1349,7 @@ _DELIVERY_ONLY_FIELDS = {"recipient_name", "recipient_phone", "recipient_address
 # The value for a field is everything between its label's end and the next label's start.
 _LABEL_PATTERNS: list[tuple[str, str]] = [
     ("customer_name",    r"nombre del cliente[^:\n]*[:：]?"),
+    ("customer_phone",   r"tel[eé]fono del cliente[^:\n]*[:：]?"),
     ("customer_email",   r"correo del cliente[^:\n]*[:：]?"),
     ("delivery_date",    r"fecha de entrega[^:\n]*[:：]?"),
     ("recipient_name",   r"nombre de la persona que recibe[^:\n]*[:：]?"),
@@ -1604,33 +1618,25 @@ async def handle_fill_template(phone: str, session: dict, text: str) -> None:
         await show_order_template(phone)
         return
 
-    # Save everything we have so far (recipient fields may be empty)
     session["delivery_date"]     = _normalize_date(parsed["delivery_date"])
     session["recipient_name"]    = parsed.get("recipient_name", "")
     session["recipient_phone"]   = parsed.get("recipient_phone", "")
     session["recipient_address"] = parsed.get("recipient_address", "")
     session["customer_name"]     = parsed.get("customer_name", "")
+    session["customer_phone"]    = parsed.get("customer_phone", "")
     session["customer_email"]    = parsed.get("customer_email", "")
     session["card_message"]      = parsed.get("card_message", "none")
-    session["delivery_window"]   = ""
 
-    if missing_recipient:
-        # Recipient info missing — ask if this is a pickup order
-        session["is_pickup"] = False
-        session["step"] = "ASK_PICKUP_CONFIRM"
-        await save_session(phone, session)
-        missing_str = ", ".join(missing_recipient)
-        await send_buttons(
-            phone,
-            body=f"Faltan: *{missing_str}*\n\n¿Es una orden de recoger en tienda?",
-            buttons=[
-                {"id": "BTN_IS_PICKUP",  "title": "Sí, es recoger"},
-                {"id": "BTN_IS_DELIVERY","title": "No, llenar info"},
-            ],
-        )
-        return
+    # Auto-detect: address present → delivery, no address → pickup
+    if parsed.get("recipient_address"):
+        session["is_pickup"]       = False
+        session["delivery_window"] = ""
+        session["shipping_rate"]   = None
+    else:
+        session["is_pickup"]       = True
+        session["delivery_window"] = "Recoger en Tienda"
+        session["shipping_rate"]   = None
 
-    session["is_pickup"] = False
     session["step"] = "REVIEW_TEMPLATE"
     await save_session(phone, session)
     await show_review_template(phone, session)
@@ -1659,8 +1665,13 @@ async def show_review_template(phone: str, session: dict) -> None:
         card_preview = card_preview[:80] + "…"
 
     customer_name  = session.get("customer_name", "")
+    customer_phone = session.get("customer_phone", "")
     customer_email = session.get("customer_email", "")
-    customer_line  = customer_name + (f" ({customer_email})" if customer_email else "")
+    customer_line  = customer_name
+    if customer_phone:
+        customer_line += f" | {customer_phone}"
+    if customer_email:
+        customer_line += f" | {customer_email}"
 
     is_pickup = session.get("is_pickup", False)
     lines = ["*Verifica la información:*\n"]
@@ -1703,14 +1714,28 @@ async def handle_review_template(phone: str, session: dict, reply_id: str) -> No
     """Handle the review confirmation or edit request."""
     if reply_id == "BTN_REVIEW_OK":
         if session.get("is_pickup"):
-            # Pickup already confirmed at template stage — skip shipping step
             session["step"] = "SELECT_PAYMENT"
             await save_session(phone, session)
             await show_payment_buttons(phone)
         else:
-            session["step"] = "SHIPPING_METHOD"
-            await save_session(phone, session)
-            await show_shipping_method(phone)
+            # Delivery — auto-calculate fee from address
+            parsed = _parse_mx_address(session.get("recipient_address", ""))
+            fee = _get_delivery_fee(parsed["zip"])
+            if fee:
+                session["shipping_rate"] = {"title": "Envío", "price": str(fee)}
+                session["step"] = "SELECT_PAYMENT"
+                await save_session(phone, session)
+                await send_text(phone, f"Cargo de envío calculado: *${fee:,}*")
+                await show_payment_buttons(phone)
+            else:
+                session["step"] = "ENTER_SHIPPING_COST"
+                await save_session(phone, session)
+                await send_text(
+                    phone,
+                    f"No encontramos el código postal *{parsed['zip'] or 'desconocido'}*.\n\n"
+                    "Escribe la zona de entrega (ej: *San Pedro*, *Escobedo*, *Apodaca*) "
+                    "o el código postal correcto:",
+                )
     elif reply_id == "BTN_REVIEW_EDIT":
         session["step"] = "FILL_TEMPLATE"
         await save_session(phone, session)
@@ -2025,8 +2050,14 @@ async def show_order_summary(phone: str, session: dict) -> None:
         return _INVISIBLE_RE.sub("", session.get(key, "") or "").strip()
 
     customer_name  = _s("customer_name")
+    customer_phone = _s("customer_phone")
     customer_email = _s("customer_email")
-    customer_line  = f"  {customer_name}" + (f" — {customer_email}" if customer_email else "") + "\n"
+    customer_line  = f"  {customer_name}"
+    if customer_phone:
+        customer_line += f" | {customer_phone}"
+    if customer_email:
+        customer_line += f" | {customer_email}"
+    customer_line += "\n"
 
     recipient_lines = (
         f"  {_s('recipient_name')}\n"
@@ -2174,35 +2205,20 @@ async def handle_back(phone: str, session: dict) -> None:
             await save_session(phone, session)
             await show_search_prompt(phone)
 
-    elif step == "ASK_PICKUP_CONFIRM":
-        session["step"] = "FILL_TEMPLATE"
-        await save_session(phone, session)
-        await show_order_template(phone)
-
     elif step == "REVIEW_TEMPLATE":
         session["step"] = "FILL_TEMPLATE"
         await save_session(phone, session)
         await show_order_template(phone)
 
-    elif step == "SHIPPING_METHOD":
+    elif step == "ENTER_SHIPPING_COST":
         session["step"] = "REVIEW_TEMPLATE"
         await save_session(phone, session)
         await show_review_template(phone, session)
 
-    elif step == "CONFIRM_SHIPPING":
-        session["step"] = "SHIPPING_METHOD"
-        await save_session(phone, session)
-        await show_shipping_method(phone)
-
-    elif step == "ENTER_SHIPPING_COST":
-        session["step"] = "SHIPPING_METHOD"
-        await save_session(phone, session)
-        await show_shipping_method(phone)
-
     elif step == "SELECT_PAYMENT":
-        session["step"] = "SHIPPING_METHOD"
+        session["step"] = "REVIEW_TEMPLATE"
         await save_session(phone, session)
-        await show_shipping_method(phone)
+        await show_review_template(phone, session)
 
     elif step == "CONFIRM":
         session["step"] = "SELECT_PAYMENT"
@@ -2293,14 +2309,8 @@ async def process_message(
     elif step == "FILL_TEMPLATE":
         await handle_fill_template(phone, session, text)
 
-    elif step == "ASK_PICKUP_CONFIRM":
-        await handle_ask_pickup_confirm(phone, session, reply_id)
-
     elif step == "REVIEW_TEMPLATE":
         await handle_review_template(phone, session, reply_id)
-
-    elif step == "SHIPPING_METHOD":
-        await handle_shipping_method(phone, session, reply_id)
 
     elif step == "ENTER_SHIPPING_COST":
         await handle_enter_shipping_cost(phone, session, text)
@@ -2325,9 +2335,6 @@ async def process_message(
 
     elif step == "SELECT_PAYMENT":
         await handle_select_payment(phone, session, reply_id)
-
-    elif step == "CONFIRM_SHIPPING":
-        await handle_confirm_shipping(phone, session, reply_id)
 
     elif step == "CONFIRM":
         await handle_confirm(phone, session, reply_id)
