@@ -1346,6 +1346,91 @@ def _normalize_date(raw: str) -> str:
     return s  # fallback: return as-is
 
 
+# ---------------------------------------------------------------------------
+# Delivery fee lookup by zip code
+# ---------------------------------------------------------------------------
+
+_GUADALUPE_ZIPS = frozenset({
+    "64834",
+    "67100","67110","67112","67113","67115","67116","67117","67118","67119",
+    "67120","67123","67124","67125","67126","67128","67129","67130","67132",
+    "67133","67134","67140","67144","67150","67153","67154","67155","67160",
+    "67163","67164","67165","67166","67167","67168","67169","67170","67173",
+    "67174","67175","67176","67177","67178","67179","67180","67182","67183",
+    "67184","67185","67186","67188","67189","67190","67192","67193","67194",
+    "67195","67196","67197","67198","67199",
+    "67200","67202","67203","67204","67205",
+})
+
+_ESCOBEDO_APODACA_ZIPS = frozenset({
+    "65780",
+    "66050","66051","66052","66053","66054","66055","66056","66057","66058",
+    "66059","66060","66062","66063","66064","66065","66066","66070","66072",
+    "66073","66074","66080","66083","66084","66085",
+    "66600","66603","66604","66605","66606","66609","66610","66612","66613",
+    "66614","66620","66623","66626","66627","66630","66632","66633","66634",
+    "66635","66636","66637","66640","66643","66644","66645","66646","66647",
+    "66648","66649",
+})
+
+_SAN_NICOLAS_ZIPS = frozenset({
+    "66400","66410","66412","66413","66414","66415","66417","66418","66420",
+    "66422","66423","66424","66425","66426","66427","66428","66430","66434",
+    "66435","66436","66437","66438","66440","66444","66445","66446","66447",
+    "66448","66449","66450","66454","66455","66457","66458","66459","66460",
+    "66463","66464","66465","66466","66467","66468","66469","66470","66473",
+    "66474","66475","66477","66478","66480","66482","66483","66484","66485",
+    "66486","66490","66493","66494","66496",
+})
+
+_GARCIA_ZIPS = frozenset({
+    "66000","66001","66003","66004","66005","66006","66007","66008","66009",
+    "66010","66012","66013","66014","66017","66018","66020","66023","66024",
+    "66025","66026","66027","66030","66033","66035","66036","66037","66040",
+    "66042","66045","66046",
+})
+
+_CIENAGA_ZIPS = frozenset({
+    "65550","65554","65555","65556","65558","65559","65560","65562","65563",
+    "65564","65565","65567","65573","65580","65583",
+    "67450","67451","67453","67455","67460","67463","67465","67470","67473",
+    "67474","67475","67480","67483","67484","67485","67486","67488","67490",
+    "67492","67497",
+})
+
+
+def _get_delivery_fee(zip_code: str) -> int | None:
+    """
+    Return the delivery fee (MXN) for a zip code based on configured zones.
+    Returns None if the zip is outside all delivery zones.
+    Specific zip sets are checked before ranges to handle overlaps (e.g. 64834
+    belongs to Guadalupe at $149, not Monterrey at $99).
+    Monterrey Valle Alto ($129) is checked before general Monterrey ($99).
+    """
+    if not zip_code:
+        return None
+
+    # Specific zip sets (highest priority — override any range below)
+    if zip_code in _GUADALUPE_ZIPS:       return 149
+    if zip_code in _ESCOBEDO_APODACA_ZIPS: return 149
+    if zip_code in _SAN_NICOLAS_ZIPS:     return 149
+    if zip_code in _GARCIA_ZIPS:          return 299
+    if zip_code in _CIENAGA_ZIPS:         return 349
+
+    try:
+        z = int(zip_code)
+    except ValueError:
+        return None
+
+    if 64978 <= z <= 64997: return 129   # Monterrey Valle Alto — before general MTY
+    if 64000 <= z <= 64997: return 99    # Monterrey
+    if 66200 <= z <= 66296: return 99    # San Pedro Garza García
+    if 66100 <= z <= 66390: return 99    # Santa Catarina
+    if 67300 <= z <= 67344: return 299   # Santiago
+
+    return None
+
+
 async def handle_fill_template(phone: str, session: dict, text: str) -> None:
     """
     Parse the filled-in order template and advance to SELECT_PAYMENT.
@@ -1427,14 +1512,83 @@ async def show_payment_buttons(phone: str) -> None:
 async def handle_review_template(phone: str, session: dict, reply_id: str) -> None:
     """Handle the review confirmation or edit request."""
     if reply_id == "BTN_REVIEW_OK":
-        session["step"] = "SELECT_PAYMENT"
+        session["step"] = "SHIPPING_METHOD"
         await save_session(phone, session)
-        await show_payment_buttons(phone)
+        await show_shipping_method(phone)
     elif reply_id == "BTN_REVIEW_EDIT":
         session["step"] = "FILL_TEMPLATE"
         await save_session(phone, session)
         await send_text(phone, "Sin problema, envía la información corregida:")
         await show_order_template(phone)
+
+
+async def show_shipping_method(phone: str) -> None:
+    """Ask staff whether this order is delivery or in-store pickup."""
+    await send_buttons(
+        phone,
+        body="¿Cómo se va a entregar este pedido?",
+        buttons=[
+            {"id": "BTN_DELIVERY", "title": "Envio a domicilio"},
+            {"id": "BTN_PICKUP",   "title": "Recoger en tienda"},
+            {"id": "BTN_BACK",     "title": "Volver"},
+        ],
+    )
+
+
+async def handle_shipping_method(phone: str, session: dict, reply_id: str) -> None:
+    """Route to delivery fee check or straight to payment for pickup."""
+    if reply_id == "BTN_PICKUP":
+        session["is_pickup"]       = True
+        session["delivery_window"] = "Recoger en Tienda"
+        session["shipping_rate"]   = None
+        session["step"] = "SELECT_PAYMENT"
+        await save_session(phone, session)
+        await show_payment_buttons(phone)
+
+    elif reply_id == "BTN_DELIVERY":
+        session["is_pickup"] = False
+        parsed = _parse_mx_address(session.get("recipient_address", ""))
+        fee = _get_delivery_fee(parsed["zip"])
+
+        if fee:
+            session["step"] = "CONFIRM_SHIPPING"
+            await save_session(phone, session)
+            await send_buttons(
+                phone,
+                body=f"Cargo de envio calculado: *${fee:,}*\n\n¿Incluir en el pedido?",
+                buttons=[
+                    {"id": "BTN_SHIP_YES", "title": f"Si, ${fee:,}"},
+                    {"id": "BTN_SHIP_NO",  "title": "No incluir"},
+                    {"id": "BTN_BACK",     "title": "Volver"},
+                ],
+            )
+        else:
+            session["step"] = "ENTER_SHIPPING_COST"
+            await save_session(phone, session)
+            await send_text(
+                phone,
+                f"No pudimos verificar el codigo postal *{parsed['zip'] or 'desconocido'}*.\n\n"
+                "Escribe el costo de envio (o *0* si no aplica):",
+            )
+
+
+async def handle_enter_shipping_cost(phone: str, session: dict, text: str) -> None:
+    """Staff manually enters delivery fee (or 0 for no fee)."""
+    cleaned = text.strip().replace(",", "").replace("$", "")
+    try:
+        fee = float(cleaned)
+    except ValueError:
+        await send_text(phone, "Por favor escribe solo el monto (ej: *150* o *0* si no aplica):")
+        return
+
+    if fee > 0:
+        session["shipping_rate"] = {"title": "Envio a domicilio", "price": str(int(fee))}
+    else:
+        session["shipping_rate"] = None
+
+    session["step"] = "SELECT_PAYMENT"
+    await save_session(phone, session)
+    await show_payment_buttons(phone)
 
 
 # ---------------------------------------------------------------------------
@@ -1605,51 +1759,22 @@ async def handle_enter_card(phone: str, session: dict, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def handle_select_payment(phone: str, session: dict, reply_id: str) -> None:
-    """Save payment mode then show available shipping rates before the summary."""
+    """Save payment mode and proceed to order confirmation."""
     session["payment_mode"] = reply_id  # "PAY_LINK" or "PAY_PENDING"
-
-    rates = await get_shipping_rate(session)
-    if rates:
-        # Store rates in session so handle_confirm_shipping can look them up by index
-        session["_shipping_rates"] = rates
-        session["step"] = "CONFIRM_SHIPPING"
-        await save_session(phone, session)
-
-        rows = []
-        for i, r in enumerate(rates):
-            price = float(r["price"])
-            rows.append({
-                "id": f"SHIP_{i}",
-                "title": r["title"][:24],
-                "description": f"${price:,.2f}",
-            })
-        rows.append({"id": "SHIP_NONE", "title": "Sin envio", "description": "No agregar cargo"})
-
-        await send_list(
-            phone,
-            body="Selecciona el cargo de envio a aplicar:",
-            button_text="Ver opciones",
-            section_title="Envio",
-            rows=rows,
-        )
-    else:
-        session["step"] = "CONFIRM"
-        await save_session(phone, session)
-        await show_order_summary(phone, session)
+    session["step"] = "CONFIRM"
+    await save_session(phone, session)
+    await show_order_summary(phone, session)
 
 
 async def handle_confirm_shipping(phone: str, session: dict, reply_id: str) -> None:
-    """Staff selects a shipping rate or skips it."""
-    if reply_id == "SHIP_NONE":
-        session["shipping_rate"] = None
-    elif reply_id.startswith("SHIP_"):
-        idx = int(reply_id[5:])
-        rates = session.get("_shipping_rates", [])
-        session["shipping_rate"] = rates[idx] if idx < len(rates) else None
+    """Staff confirms or skips the delivery fee."""
+    if reply_id == "BTN_SHIP_YES":
+        parsed = _parse_mx_address(session.get("recipient_address", ""))
+        fee = _get_delivery_fee(parsed["zip"])
+        session["shipping_rate"] = {"title": "Envio a domicilio", "price": str(fee)} if fee else None
     else:
         session["shipping_rate"] = None
 
-    session.pop("_shipping_rates", None)
     session["step"] = "CONFIRM"
     await save_session(phone, session)
     await show_order_summary(phone, session)
@@ -1811,33 +1936,30 @@ async def handle_back(phone: str, session: dict) -> None:
         await save_session(phone, session)
         await show_order_template(phone)
 
-    elif step == "SELECT_PAYMENT":
+    elif step == "SHIPPING_METHOD":
         session["step"] = "REVIEW_TEMPLATE"
         await save_session(phone, session)
         await show_review_template(phone, session)
 
     elif step == "CONFIRM_SHIPPING":
+        session["step"] = "SHIPPING_METHOD"
+        await save_session(phone, session)
+        await show_shipping_method(phone)
+
+    elif step == "ENTER_SHIPPING_COST":
+        session["step"] = "SHIPPING_METHOD"
+        await save_session(phone, session)
+        await show_shipping_method(phone)
+
+    elif step == "SELECT_PAYMENT":
+        session["step"] = "SHIPPING_METHOD"
+        await save_session(phone, session)
+        await show_shipping_method(phone)
+
+    elif step == "CONFIRM":
         session["step"] = "SELECT_PAYMENT"
         await save_session(phone, session)
         await show_payment_buttons(phone)
-
-    elif step == "CONFIRM":
-        # Re-use cached rates if still in session, otherwise re-fetch
-        rates = session.get("_shipping_rates") or await get_shipping_rate(session)
-        if rates:
-            session["_shipping_rates"] = rates
-            session["step"] = "CONFIRM_SHIPPING"
-            await save_session(phone, session)
-            rows = []
-            for i, r in enumerate(rates):
-                price = float(r["price"])
-                rows.append({"id": f"SHIP_{i}", "title": r["title"][:24], "description": f"${price:,.2f}"})
-            rows.append({"id": "SHIP_NONE", "title": "Sin envio", "description": "No agregar cargo"})
-            await send_list(phone, body="Selecciona el cargo de envio:", button_text="Ver opciones", section_title="Envio", rows=rows)
-        else:
-            session["step"] = "SELECT_PAYMENT"
-            await save_session(phone, session)
-            await show_payment_buttons(phone)
 
     else:
         await send_text(phone, "No hay paso anterior. Escribe *cancel* para empezar de nuevo.")
@@ -1922,6 +2044,12 @@ async def process_message(
 
     elif step == "REVIEW_TEMPLATE":
         await handle_review_template(phone, session, reply_id)
+
+    elif step == "SHIPPING_METHOD":
+        await handle_shipping_method(phone, session, reply_id)
+
+    elif step == "ENTER_SHIPPING_COST":
+        await handle_enter_shipping_cost(phone, session, text)
 
     elif step in ("SELECT_DATE", "ENTER_DATE"):
         await handle_select_date(phone, session, reply_id, text)
