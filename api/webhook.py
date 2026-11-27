@@ -2098,7 +2098,6 @@ async def debug_delivery() -> JSONResponse:
           node {
             id
             name
-            isDefault
             profileLocationGroups {
               locationGroupZones(first: 30) {
                 edges {
