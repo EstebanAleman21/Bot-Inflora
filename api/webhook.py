@@ -1399,6 +1399,31 @@ _CIENAGA_ZIPS = frozenset({
 })
 
 
+_ZONE_FEES: dict[str, int] = {
+    "san pedro": 99, "san pedro garza garcia": 99, "garza garcia": 99,
+    "monterrey": 99,
+    "santa catarina": 99,
+    "guadalupe": 149,
+    "escobedo": 149, "general escobedo": 149,
+    "apodaca": 149,
+    "san nicolas": 149, "san nicolás": 149, "san nicolas de los garza": 149,
+    "garcia": 299, "garcía": 299,
+    "santiago": 299,
+    "cienega": 349, "ciénega": 349, "cienega de flores": 349, "ciénega de flores": 349,
+}
+
+_ACCENT_MAP = str.maketrans("áéíóúÁÉÍÓÚ", "aeiouAEIOU")
+
+
+def _get_delivery_fee_by_zone(zone_text: str) -> int | None:
+    """Return delivery fee for a free-text zone name, or None if not matched."""
+    normalized = zone_text.lower().strip().translate(_ACCENT_MAP)
+    for zone, fee in _ZONE_FEES.items():
+        if zone.translate(_ACCENT_MAP) in normalized:
+            return fee
+    return None
+
+
 def _get_delivery_fee(zip_code: str) -> int | None:
     """
     Return the delivery fee (MXN) for a zip code based on configured zones.
@@ -1528,7 +1553,7 @@ async def show_shipping_method(phone: str) -> None:
         phone,
         body="¿Cómo se va a entregar este pedido?",
         buttons=[
-            {"id": "BTN_DELIVERY", "title": "Envio a domicilio"},
+            {"id": "BTN_DELIVERY", "title": "Entrega local"},
             {"id": "BTN_PICKUP",   "title": "Recoger en tienda"},
             {"id": "BTN_BACK",     "title": "Volver"},
         ],
@@ -1567,22 +1592,47 @@ async def handle_shipping_method(phone: str, session: dict, reply_id: str) -> No
             await save_session(phone, session)
             await send_text(
                 phone,
-                f"No pudimos verificar el codigo postal *{parsed['zip'] or 'desconocido'}*.\n\n"
-                "Escribe el costo de envio (o *0* si no aplica):",
+                f"No encontramos el código postal *{parsed['zip'] or 'desconocido'}*.\n\n"
+                "Escribe la zona de entrega (ej: *San Pedro*, *Escobedo*, *Apodaca*) "
+                "o el código postal correcto:",
             )
 
 
 async def handle_enter_shipping_cost(phone: str, session: dict, text: str) -> None:
-    """Staff manually enters delivery fee (or 0 for no fee)."""
-    cleaned = text.strip().replace(",", "").replace("$", "")
-    try:
-        fee = float(cleaned)
-    except ValueError:
-        await send_text(phone, "Por favor escribe solo el monto (ej: *150* o *0* si no aplica):")
+    """Staff enters a zone name, zip code, or manual price to set the delivery fee."""
+    raw = text.strip()
+
+    # 1. Try zone name lookup
+    fee = _get_delivery_fee_by_zone(raw)
+
+    # 2. Try 5-digit zip code
+    if fee is None:
+        zip_match = re.search(r"\b(\d{5})\b", raw)
+        if zip_match:
+            fee = _get_delivery_fee(zip_match.group(1))
+
+    if fee is not None:
+        session["shipping_rate"] = {"title": "Envío", "price": str(fee)}
+        session["step"] = "SELECT_PAYMENT"
+        await save_session(phone, session)
+        await send_text(phone, f"Cargo de envío calculado: *${fee:,}*")
+        await show_payment_buttons(phone)
         return
 
-    if fee > 0:
-        session["shipping_rate"] = {"title": "Envio a domicilio", "price": str(int(fee))}
+    # 3. Fall back to manual numeric price
+    cleaned = raw.replace(",", "").replace("$", "")
+    try:
+        manual_fee = float(cleaned)
+    except ValueError:
+        await send_text(
+            phone,
+            "No reconocimos la zona. Escribe la zona (ej: *San Pedro*, *Escobedo*, *Apodaca*), "
+            "el código postal, o el monto directo (ej: *150* o *0* si no aplica):",
+        )
+        return
+
+    if manual_fee > 0:
+        session["shipping_rate"] = {"title": "Envío", "price": str(int(manual_fee))}
     else:
         session["shipping_rate"] = None
 
@@ -1771,7 +1821,7 @@ async def handle_confirm_shipping(phone: str, session: dict, reply_id: str) -> N
     if reply_id == "BTN_SHIP_YES":
         parsed = _parse_mx_address(session.get("recipient_address", ""))
         fee = _get_delivery_fee(parsed["zip"])
-        session["shipping_rate"] = {"title": "Envio a domicilio", "price": str(fee)} if fee else None
+        session["shipping_rate"] = {"title": "Envío", "price": str(fee)} if fee else None
     else:
         session["shipping_rate"] = None
 
