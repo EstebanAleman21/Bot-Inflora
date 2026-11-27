@@ -1933,15 +1933,12 @@ async def handle_confirm(phone: str, session: dict, reply_id: str) -> None:
             await delete_session(phone)
             return
 
-        status_line = (
-            f"\n\n📦 Link de seguimiento para el cliente:\n{completed['statusUrl']}"
-            if completed.get("statusUrl") else ""
-        )
-        confirmation = (
-            f"Orden *{completed['name']}* creada con pago pendiente en Shopify!"
-            f"{status_line}\n\n"
-            "Escribe *new* para empezar otra orden."
-        )
+        confirmation = f"Orden *{completed['name']}* creada con pago pendiente en Shopify!"
+        if completed.get("statusUrl"):
+            confirmation += f"\n\n📦 *Link de seguimiento (cliente):*\n{completed['statusUrl']}"
+        if completed.get("packingSlipUrl"):
+            confirmation += f"\n\n🖨️ *Packing slip:*\n{completed['packingSlipUrl']}"
+        confirmation += "\n\nEscribe *new* para empezar otra orden."
     else:
         # PAY_LINK — share the invoice URL with the staff member
         confirmation = (
@@ -1951,11 +1948,7 @@ async def handle_confirm(phone: str, session: dict, reply_id: str) -> None:
         )
 
     await delete_session(phone)
-    await send_buttons(
-        phone,
-        body=confirmation,
-        buttons=[{"id": "BTN_NEW_ORDER", "title": "New Order"}],
-    )
+    await send_text(phone, confirmation)
 
 
 # ===========================================================================
