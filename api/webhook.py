@@ -756,6 +756,9 @@ async def complete_draft_order(draft_order_id: str) -> dict:
     Raises ValueError on userErrors.
     """
     result = await _shopify_gql(_DRAFT_ORDER_COMPLETE, {"id": draft_order_id, "paymentPending": True})
+    if "data" not in result:
+        log.error("draftOrderComplete GQL error: %s", result)
+        raise ValueError(f"Shopify GQL error: {result.get('errors', result)}")
     payload = result["data"]["draftOrderComplete"]
 
     if payload["userErrors"]:
