@@ -465,6 +465,8 @@ mutation DraftOrderComplete($id: ID!, $paymentPending: Boolean) {
       order {
         id
         name
+        statusUrl
+        packingSlipUrl
       }
     }
     userErrors { field message }
@@ -747,11 +749,11 @@ async def create_draft_order(session: dict) -> dict:
     }
 
 
-async def complete_draft_order(draft_order_id: str) -> str:
+async def complete_draft_order(draft_order_id: str) -> dict:
     """
     Complete (pay and finalise) a Shopify draft order.
 
-    Returns the resulting order name (e.g. "#1045").
+    Returns {"name": str, "statusUrl": str}.
     Raises ValueError on userErrors.
     """
     result = await _shopify_gql(_DRAFT_ORDER_COMPLETE, {"id": draft_order_id, "paymentPending": True})
@@ -761,7 +763,12 @@ async def complete_draft_order(draft_order_id: str) -> str:
         errors = "; ".join(f"{e['field']}: {e['message']}" for e in payload["userErrors"])
         raise ValueError(f"Shopify complete order error: {errors}")
 
-    return payload["draftOrder"]["order"]["name"]
+    order = payload["draftOrder"]["order"]
+    return {
+        "name": order["name"],
+        "statusUrl": order.get("statusUrl", ""),
+        "packingSlipUrl": order.get("packingSlipUrl", ""),
+    }
 
 
 # ===========================================================================
@@ -1920,22 +1927,31 @@ async def handle_confirm(phone: str, session: dict, reply_id: str) -> None:
     if payment_mode == "PAY_PENDING":
         # Complete the draft into a finalised paid order
         try:
-            order_name = await complete_draft_order(draft["draftOrderId"])
+            completed = await complete_draft_order(draft["draftOrderId"])
         except ValueError as exc:
             await send_text(phone, f"Shopify complete error: {exc}\n\nDraft saved as {draft['name']}.")
             await delete_session(phone)
             return
 
+        status_line = (
+            f"\n\n📦 Link de seguimiento para el cliente:\n{completed['statusUrl']}"
+            if completed.get("statusUrl") else ""
+        )
+        slip_line = (
+            f"\n\n🖨️ Packing slip (válido 7 días):\n{completed['packingSlipUrl']}"
+            if completed.get("packingSlipUrl") else ""
+        )
         confirmation = (
-            f"Order *{order_name}* created with pending payment in Shopify!\n\n"
-            "Type *new* to start another order."
+            f"Orden *{completed['name']}* creada con pago pendiente en Shopify!"
+            f"{status_line}{slip_line}\n\n"
+            "Escribe *new* para empezar otra orden."
         )
     else:
         # PAY_LINK — share the invoice URL with the staff member
         confirmation = (
-            f"Draft order *{draft['name']}* created.\n\n"
-            f"Payment link:\n{draft['invoiceUrl']}\n\n"
-            "Share this link with the customer. Type *new* to start another order."
+            f"Borrador *{draft['name']}* creado.\n\n"
+            f"Envía este link al cliente para ver su orden y pagar:\n{draft['invoiceUrl']}\n\n"
+            "Escribe *new* para empezar otra orden."
         )
 
     await delete_session(phone)
