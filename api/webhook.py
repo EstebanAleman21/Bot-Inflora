@@ -318,10 +318,11 @@ query GetProducts($cursor: String) {
         collections(first: 10) {
           edges { node { id } }
         }
-        variants(first: 1) {
+        variants(first: 20) {
           edges {
             node {
               id
+              title
               price
             }
           }
@@ -394,16 +395,21 @@ async def get_catalog(force_refresh: bool = False) -> dict:
         for edge in page["edges"]:
             node = edge["node"]
             pid = node["id"]
-            variant_node = node["variants"]["edges"][0]["node"] if node["variants"]["edges"] else None
-            if not variant_node:
+            variant_edges = node["variants"]["edges"]
+            if not variant_edges:
                 continue  # skip products with no variants
 
+            all_variants = [
+                {"id": v["node"]["id"], "title": v["node"]["title"], "price": v["node"]["price"]}
+                for v in variant_edges
+            ]
             col_ids = [c["node"]["id"] for c in node["collections"]["edges"]]
             products[pid] = {
                 "id": pid,
                 "title": node["title"],
-                "variantId": variant_node["id"],
-                "price": variant_node["price"],
+                "variantId": all_variants[0]["id"],   # kept for backward compat
+                "price": all_variants[0]["price"],
+                "variants": all_variants,
                 "collectionIds": col_ids,
             }
             for cid in col_ids:
@@ -1065,12 +1071,13 @@ async def show_product_page(phone: str, session: dict, catalog: dict) -> None:
         prod = catalog["products"].get(pid)
         if not prod:
             continue
-        variant_short = prod["variantId"].split("/")[-1]
+        prod_short = prod["id"].split("/")[-1]
+        multi = len(prod.get("variants", [])) > 1
+        price_label = f"desde ${prod['price']}" if multi else f"${prod['price']}"
         rows.append({
-            "id": f"PROD_{variant_short}",
+            "id": f"PROD_{prod_short}",
             "title": prod["title"][:24],
-            # Full title + price in description so truncated title is still clear
-            "description": f"${prod['price']} — {prod['title']}"[:72],
+            "description": f"{price_label} — {prod['title']}"[:72],
         })
 
     if has_more:
@@ -1123,30 +1130,110 @@ async def handle_select_product(
         return
 
     if reply_id.startswith("PROD_"):
-        variant_short = reply_id[5:]  # strip "PROD_"
-        full_variant_gid = f"gid://shopify/ProductVariant/{variant_short}"
-
-        # Look up the product by variant id
-        product = None
-        for prod in catalog["products"].values():
-            if prod["variantId"] == full_variant_gid:
-                product = prod
-                break
+        prod_short = reply_id[5:]  # strip "PROD_"
+        full_product_gid = f"gid://shopify/Product/{prod_short}"
+        product = catalog["products"].get(full_product_gid)
 
         if not product:
-            await send_text(phone, "Product not found. Please try again.")
+            await send_text(phone, "Producto no encontrado. Intenta de nuevo.")
             return
 
-        session["items"].append({
-            "variant_id": full_variant_gid,
-            "title": product["title"],
-            "price": product["price"],
-            "quantity": 1,
-            "is_custom": False,
-        })
-        session["step"] = "ITEM_ACTION"
-        await save_session(phone, session)
-        await show_item_action(phone, session)
+        variants = product.get("variants", [])
+        if len(variants) > 1:
+            # Multiple variants — ask which one
+            session["pending_product_id"] = full_product_gid
+            session["step"] = "SELECT_VARIANT"
+            await save_session(phone, session)
+            await show_variant_selection(phone, product)
+        else:
+            # Single variant — add directly
+            variant = variants[0] if variants else {"id": product["variantId"], "price": product["price"]}
+            session["items"].append({
+                "variant_id": variant["id"],
+                "title": product["title"],
+                "price": variant["price"],
+                "quantity": 1,
+                "is_custom": False,
+            })
+            session["step"] = "ITEM_ACTION"
+            await save_session(phone, session)
+            await show_item_action(phone, session)
+
+
+# ---------------------------------------------------------------------------
+# Step 3a-variant — SELECT_VARIANT
+# ---------------------------------------------------------------------------
+
+async def show_variant_selection(phone: str, product: dict) -> None:
+    """Show variant options for a multi-variant product."""
+    variants = product.get("variants", [])
+    title = product["title"]
+
+    if len(variants) <= 3:
+        await send_buttons(
+            phone,
+            body=f"*{title}*\n\nSelecciona una variante:",
+            buttons=[
+                {
+                    "id": f"VAR_{v['id'].split('/')[-1]}",
+                    "title": f"{v['title'][:16]} ${v['price']}"[:20],
+                }
+                for v in variants[:3]
+            ],
+        )
+    else:
+        rows = [
+            {
+                "id": f"VAR_{v['id'].split('/')[-1]}",
+                "title": v["title"][:24],
+                "description": f"${v['price']}",
+            }
+            for v in variants[:10]
+        ]
+        await send_list(
+            phone,
+            body=f"*{title}*\n\nSelecciona una variante:",
+            button_text="Ver opciones",
+            sections=[{"title": "Variantes", "rows": rows}],
+        )
+
+
+async def handle_select_variant(phone: str, session: dict, catalog: dict, reply_id: str) -> None:
+    """Add the chosen variant to the cart."""
+    if not reply_id.startswith("VAR_"):
+        return
+
+    var_short = reply_id[4:]
+    full_variant_gid = f"gid://shopify/ProductVariant/{var_short}"
+
+    product_id = session.get("pending_product_id")
+    product = catalog["products"].get(product_id) if product_id else None
+    if not product:
+        await send_text(phone, "Producto no encontrado. Intenta de nuevo.")
+        return
+
+    variant = next((v for v in product.get("variants", []) if v["id"] == full_variant_gid), None)
+    if not variant:
+        await send_text(phone, "Variante no encontrada. Intenta de nuevo.")
+        return
+
+    variant_label = variant["title"]
+    display_title = (
+        product["title"] if variant_label.lower() == "default title"
+        else f"{product['title']} — {variant_label}"
+    )
+
+    session["items"].append({
+        "variant_id": full_variant_gid,
+        "title": display_title,
+        "price": variant["price"],
+        "quantity": 1,
+        "is_custom": False,
+    })
+    session.pop("pending_product_id", None)
+    session["step"] = "ITEM_ACTION"
+    await save_session(phone, session)
+    await show_item_action(phone, session)
 
 
 # ---------------------------------------------------------------------------
@@ -2058,6 +2145,12 @@ async def handle_back(phone: str, session: dict) -> None:
         await save_session(phone, session)
         await show_search_prompt(phone)
 
+    elif step == "SELECT_VARIANT":
+        session.pop("pending_product_id", None)
+        session["step"] = "SELECT_PRODUCT"
+        await save_session(phone, session)
+        await show_product_page(phone, session, await get_catalog())
+
     elif step == "ITEM_ACTION":
         # Remove the last item that was just added
         if session.get("items"):
@@ -2189,6 +2282,9 @@ async def process_message(
 
     elif step == "SELECT_PRODUCT":
         await handle_select_product(phone, session, catalog, reply_id)
+
+    elif step == "SELECT_VARIANT":
+        await handle_select_variant(phone, session, catalog, reply_id)
 
     elif step == "ITEM_ACTION":
         await handle_item_action(phone, session, catalog, reply_id)
