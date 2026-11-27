@@ -618,14 +618,13 @@ async def get_shipping_rate(session: dict) -> dict | None:
             data["data"]["draftOrderCalculate"]
             ["calculatedDraftOrder"]["availableShippingRates"]
         )
-        if not rates:
-            return None
-
-        rate = rates[0]
-        return {"title": rate["title"], "price": rate["price"]["amount"]}
+        return [
+            {"title": r["title"], "price": r["price"]["amount"]}
+            for r in rates
+        ]
     except Exception:
-        log.exception("get_shipping_rate failed")
-        return None
+        log.exception("get_shipping_rates failed")
+        return []
 
 
 async def create_draft_order(session: dict) -> dict:
@@ -1606,25 +1605,32 @@ async def handle_enter_card(phone: str, session: dict, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def handle_select_payment(phone: str, session: dict, reply_id: str) -> None:
-    """Save payment mode then calculate shipping before showing the summary."""
+    """Save payment mode then show available shipping rates before the summary."""
     session["payment_mode"] = reply_id  # "PAY_LINK" or "PAY_PENDING"
 
-    rate = await get_shipping_rate(session)
-    if rate:
+    rates = await get_shipping_rate(session)
+    if rates:
+        # Store rates in session so handle_confirm_shipping can look them up by index
+        session["_shipping_rates"] = rates
         session["step"] = "CONFIRM_SHIPPING"
         await save_session(phone, session)
-        price = float(rate["price"])
-        await send_buttons(
+
+        rows = []
+        for i, r in enumerate(rates):
+            price = float(r["price"])
+            rows.append({
+                "id": f"SHIP_{i}",
+                "title": r["title"][:24],
+                "description": f"${price:,.2f}",
+            })
+        rows.append({"id": "SHIP_NONE", "title": "Sin envio", "description": "No agregar cargo"})
+
+        await send_list(
             phone,
-            body=(
-                f"Envio calculado: *{rate['title']}* — *${price:,.2f}*\n\n"
-                "¿Incluir cargo de envio en el pedido?"
-            ),
-            buttons=[
-                {"id": "BTN_SHIP_YES", "title": "Si, incluir"},
-                {"id": "BTN_SHIP_NO",  "title": "No incluir"},
-                {"id": "BTN_BACK",     "title": "Volver"},
-            ],
+            body="Selecciona el cargo de envio a aplicar:",
+            button_text="Ver opciones",
+            section_title="Envio",
+            rows=rows,
         )
     else:
         session["step"] = "CONFIRM"
@@ -1633,14 +1639,17 @@ async def handle_select_payment(phone: str, session: dict, reply_id: str) -> Non
 
 
 async def handle_confirm_shipping(phone: str, session: dict, reply_id: str) -> None:
-    """Staff confirms or skips the calculated shipping charge."""
-    if reply_id == "BTN_SHIP_YES":
-        # Rate was already fetched — re-fetch to get it back (not stored yet)
-        rate = await get_shipping_rate(session)
-        session["shipping_rate"] = rate
+    """Staff selects a shipping rate or skips it."""
+    if reply_id == "SHIP_NONE":
+        session["shipping_rate"] = None
+    elif reply_id.startswith("SHIP_"):
+        idx = int(reply_id[5:])
+        rates = session.get("_shipping_rates", [])
+        session["shipping_rate"] = rates[idx] if idx < len(rates) else None
     else:
         session["shipping_rate"] = None
 
+    session.pop("_shipping_rates", None)
     session["step"] = "CONFIRM"
     await save_session(phone, session)
     await show_order_summary(phone, session)
@@ -1813,24 +1822,18 @@ async def handle_back(phone: str, session: dict) -> None:
         await show_payment_buttons(phone)
 
     elif step == "CONFIRM":
-        session["step"] = "CONFIRM_SHIPPING"
-        await save_session(phone, session)
-        # Re-trigger the shipping question
-        rate = await get_shipping_rate(session)
-        if rate:
-            price = float(rate["price"])
-            await send_buttons(
-                phone,
-                body=(
-                    f"Envio calculado: *{rate['title']}* — *${price:,.2f}*\n\n"
-                    "¿Incluir cargo de envio en el pedido?"
-                ),
-                buttons=[
-                    {"id": "BTN_SHIP_YES", "title": "Si, incluir"},
-                    {"id": "BTN_SHIP_NO",  "title": "No incluir"},
-                    {"id": "BTN_BACK",     "title": "Volver"},
-                ],
-            )
+        # Re-use cached rates if still in session, otherwise re-fetch
+        rates = session.get("_shipping_rates") or await get_shipping_rate(session)
+        if rates:
+            session["_shipping_rates"] = rates
+            session["step"] = "CONFIRM_SHIPPING"
+            await save_session(phone, session)
+            rows = []
+            for i, r in enumerate(rates):
+                price = float(r["price"])
+                rows.append({"id": f"SHIP_{i}", "title": r["title"][:24], "description": f"${price:,.2f}"})
+            rows.append({"id": "SHIP_NONE", "title": "Sin envio", "description": "No agregar cargo"})
+            await send_list(phone, body="Selecciona el cargo de envio:", button_text="Ver opciones", section_title="Envio", rows=rows)
         else:
             session["step"] = "SELECT_PAYMENT"
             await save_session(phone, session)
@@ -2048,6 +2051,42 @@ async def debug_order(name: str = "") -> JSONResponse:
         if not edges:
             return JSONResponse({"error": f"Order #{name} not found"}, status_code=404)
         return JSONResponse(edges[0]["node"])
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/debug/shipping")
+async def debug_shipping(zip: str = "", city: str = "San Pedro Garza García") -> JSONResponse:
+    """
+    Debug endpoint — returns all shipping rates Shopify/Scrollengine calculates
+    for a given zip code.
+    GET /api/debug/shipping?zip=66220
+    GET /api/debug/shipping?zip=66220&city=Monterrey
+    """
+    if not zip:
+        return JSONResponse({"error": "Pass ?zip=<postal_code> e.g. ?zip=66220"}, status_code=400)
+
+    calc_input: dict = {
+        "lineItems": [{"title": "Test Item", "originalUnitPrice": "1000", "quantity": 1}],
+        "shippingAddress": {
+            "firstName": "Test",
+            "lastName": "Debug",
+            "address1": "Calle Test 123",
+            "city": city,
+            "province": "Nuevo León",
+            "zip": zip,
+            "countryCode": "MX",
+        },
+    }
+    try:
+        data = await _shopify_gql(_DRAFT_ORDER_CALCULATE, {"input": calc_input})
+        if data.get("errors") or data.get("data") is None:
+            return JSONResponse({"error": data.get("errors")}, status_code=500)
+        rates = (
+            data["data"]["draftOrderCalculate"]
+            ["calculatedDraftOrder"]["availableShippingRates"]
+        )
+        return JSONResponse({"zip": zip, "city": city, "rates": rates})
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
