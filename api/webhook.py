@@ -753,6 +753,8 @@ async def create_draft_order(session: dict) -> dict:
             "title": shipping_rate["title"],
             "price": shipping_rate["price"],
         }
+    elif is_pickup:
+        draft_input["shippingLine"] = {"title": "Retiro en tienda", "price": "0"}
 
     result = await _shopify_gql(_DRAFT_ORDER_CREATE, {"input": draft_input})
     payload = result["data"]["draftOrderCreate"]
