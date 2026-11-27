@@ -1832,9 +1832,9 @@ async def handle_confirm_shipping(phone: str, session: dict, reply_id: str) -> N
     else:
         session["shipping_rate"] = None
 
-    session["step"] = "CONFIRM"
+    session["step"] = "SELECT_PAYMENT"
     await save_session(phone, session)
-    await show_order_summary(phone, session)
+    await show_payment_buttons(phone)
 
 
 async def show_order_summary(phone: str, session: dict) -> None:
@@ -1851,7 +1851,7 @@ async def show_order_summary(phone: str, session: dict) -> None:
         total += sub
         item_lines.append(f"  • {item['title']} x{qty} = ${sub:,.2f}")
 
-    payment_label = "Payment Link" if session["payment_mode"] == "PAY_LINK" else "Pending Payment"
+    payment_label = "Payment Link" if session.get("payment_mode") == "PAY_LINK" else "Pending Payment"
     card_msg = session.get("card_message", "none")
     is_pickup = session.get("is_pickup", False)
     delivery_type = "Pickup" if is_pickup else "Delivery"
@@ -1937,13 +1937,9 @@ async def handle_confirm(phone: str, session: dict, reply_id: str) -> None:
             f"\n\n📦 Link de seguimiento para el cliente:\n{completed['statusUrl']}"
             if completed.get("statusUrl") else ""
         )
-        slip_line = (
-            f"\n\n🖨️ Packing slip (válido 7 días):\n{completed['packingSlipUrl']}"
-            if completed.get("packingSlipUrl") else ""
-        )
         confirmation = (
             f"Orden *{completed['name']}* creada con pago pendiente en Shopify!"
-            f"{status_line}{slip_line}\n\n"
+            f"{status_line}\n\n"
             "Escribe *new* para empezar otra orden."
         )
     else:
